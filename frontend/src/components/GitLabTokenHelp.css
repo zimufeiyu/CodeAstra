@@ -1,0 +1,63 @@
+.gitlab-token-help {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid #dbe5f0;
+  border-radius: 12px;
+  background: #f7faff;
+  color: #42526a;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.gitlab-token-help h3,
+.gitlab-token-help p,
+.gitlab-token-help ol {
+  margin: 0;
+}
+
+.gitlab-token-help h3 {
+  color: #1f2d3d;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.gitlab-token-help ol {
+  display: grid;
+  gap: 4px;
+  padding-left: 22px;
+}
+
+.gitlab-token-help code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: #e8f0fb;
+  color: #24558a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.gitlab-token-warning {
+  padding: 8px 10px;
+  border-left: 3px solid #d69e2e;
+  border-radius: 5px;
+  background: #fffaf0;
+  color: #744210;
+}
+
+.gitlab-token-help a {
+  width: fit-content;
+  color: #2f6feb;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.gitlab-token-help a:hover {
+  text-decoration: underline;
+}
+
+.gitlab-token-help a:focus-visible {
+  border-radius: 4px;
+  outline: 3px solid rgba(47, 111, 235, 0.28);
+  outline-offset: 3px;
+}
