@@ -6,6 +6,7 @@ import {
   deleteReviewSession,
   getReviewFollowups,
   listReviewSessions,
+  previewReviewFollowupFix,
   renameReviewSession,
 } from "./client";
 
@@ -74,9 +75,10 @@ describe("review interaction API client", () => {
       finding_id: "finding-1",
       selected_code: "eval(user_input)",
     };
-    await expect(askReviewFollowup("review-1", "为什么危险？", context)).resolves.toEqual(
-      exchange.messages,
-    );
+    await expect(askReviewFollowup("review-1", "为什么危险？", context)).resolves.toEqual({
+      action: "answer",
+      messages: exchange.messages,
+    });
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/reviews?limit=20&offset=0");
     expect(fetchMock.mock.calls[1]?.[0]).toBe("/v1/reviews/review-1/followups");
@@ -123,15 +125,67 @@ describe("review interaction API client", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      decideReviewFinding("review-1", "finding-1", "keep"),
+      decideReviewFinding("review-1", "finding-1", "deferred"),
     ).resolves.toEqual(result);
     expect(fetchMock).toHaveBeenCalledWith(
       "/v1/reviews/review-1/findings/finding-1/decision",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision: "keep" }),
+        body: JSON.stringify({ decision: "deferred" }),
       },
+    );
+  });
+
+  it("submits a bounded finding follow-up fix preview payload", async () => {
+    const candidate = {
+      candidate_id: "candidate-1",
+      review_id: "review-1",
+      finding_id: "finding-1",
+      file_id: "file-1",
+      relative_path: "snippet.py",
+      created_at: "2026-08-21T00:00:00+00:00",
+      expires_at: "2026-08-21T00:10:00+00:00",
+      base_sha256: "a".repeat(64),
+      after_sha256: "b".repeat(64),
+      diff: "--- a/snippet.py\n+++ b/snippet.py\n",
+      explanation: "按追问指令生成候选",
+      validation: ["Python 语法解析通过"],
+      output_token_budget: 256,
+      finding_state: "candidate_ready",
+      fix_safety: "requires_review",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ candidate, phase: "awaiting_confirmation" }), {
+        status: 200,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const payload = {
+      instruction: "b 缺失时使用空字典",
+      base_sha: "a".repeat(64),
+      context: {
+        kind: "finding" as const,
+        file_id: "file-1",
+        finding_id: "finding-1",
+        selected_code: "a = b",
+      },
+    };
+
+    await expect(
+      previewReviewFollowupFix("review-1", payload, "deepseek-key"),
+    ).resolves.toEqual(candidate);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/reviews/review-1/followups/fix-preview",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify(payload),
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+          "X-DeepSeek-API-Key": "deepseek-key",
+        }),
+      }),
     );
   });
 

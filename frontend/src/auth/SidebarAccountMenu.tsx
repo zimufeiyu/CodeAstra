@@ -40,7 +40,7 @@ export function SidebarAccountMenu({ user, onOpenSettings, onOpenAdmin, onSignOu
     </div> : null}
     <button ref={triggerRef} type="button" className="sidebar-account-trigger" aria-label={`${user.username} 的账户菜单`} aria-expanded={open} aria-controls={open ? menuId : undefined} onClick={() => setOpen((value) => !value)}>
       <span className="sidebar-account-avatar" aria-hidden="true">{initial}</span>
-      <span className="sidebar-account-copy"><strong>{user.username}</strong><small>{user.role === "admin" ? "管理员" : "账户与设置"}</small></span>
+      <span className="sidebar-account-copy"><strong title={user.username}>{user.username}</strong><small>{user.role === "admin" ? "管理员" : "账户与设置"}</small></span>
       <MoreHorizontal size={18} aria-hidden="true" />
     </button>
   </div>;

@@ -54,6 +54,11 @@ export function FollowupDialog({ context, messages, assistantName, error, busy, 
           {messages.map((message) => <article className={`followup-message followup-${message.role}`} key={message.message_id}><span>{message.role === "user" ? "你" : assistantName}</span><p>{message.content}</p></article>)}
           {!messages.length ? <p className="muted">可以询问原因、影响、修改方式或替代方案。</p> : null}
         </div>
+        <p className="followup-fix-hint">
+          {context.kind === "finding"
+            ? "输入明确祈使句可生成受限修改候选；疑问和解释请求只会回答。候选仍需 Diff 确认。"
+            : "代码选区仅支持解释追问；如需修改，请从已验证的审查问题发起。"}
+        </p>
         {error ? <p className="auth-error" role="alert">{error}</p> : null}
         <form className="followup-dialog-form" onSubmit={submit}>
           <label className="sr-only" htmlFor="context-followup-question">针对当前代码追问</label>
@@ -63,4 +68,4 @@ export function FollowupDialog({ context, messages, assistantName, error, busy, 
       </section>
     </div>
   );
-}
+}

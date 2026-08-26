@@ -4,6 +4,7 @@ import ast
 import hashlib
 from collections.abc import Iterable
 
+from code_review.application.python_analysis_cache import parse_python_source
 from code_review.domain.review_chunks import ReviewChunk, ReviewPlanningError
 from code_review.domain.review_models import SourceFile
 
@@ -18,7 +19,7 @@ class PythonSyntaxChunker:
         split_depth: int = 0,
     ) -> list[ReviewChunk]:
         try:
-            module = ast.parse(source.content, filename=source.relative_path)
+            module = parse_python_source(source)
         except SyntaxError as error:
             raise ReviewPlanningError(
                 message=f"Python 语法解析失败：第 {error.lineno or 1} 行。",

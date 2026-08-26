@@ -71,7 +71,7 @@ test("connects from GitLab import and returns with the MR address and account se
   const mergeRequestUrl =
     "https://gitlab.cigai.cn:1443/group/project/-/merge_requests/12";
   await user.type(screen.getByLabelText("合并请求地址"), mergeRequestUrl);
-  await user.click(screen.getByRole("button", { name: "连接 GitLab 并继续" }));
+  await user.click(screen.getByRole("button", { name: "管理旧版 GitLab 账户" }));
 
   expect(screen.getByRole("region", { name: "账户安全" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "GitLab 连接" })).toBeInTheDocument();
@@ -90,9 +90,9 @@ test("connects from GitLab import and returns with the MR address and account se
   });
   expect(screen.getByLabelText("合并请求地址")).toHaveValue(mergeRequestUrl);
   expect(
-    screen.getByText("使用 @reviewer 读取 https://gitlab.cigai.cn:1443"),
+    screen.getByText(/旧 PAT 账户属于其他连接方式：当前使用 @reviewer 读取 https:\/\/gitlab\.cigai\.cn:1443/),
   ).toBeInTheDocument();
-  expect(screen.queryByLabelText("访问令牌（私有项目需要）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("访问令牌（旧版兼容方式）")).not.toBeInTheDocument();
   expect(verifyGitLabAccount).toHaveBeenCalledWith(
     "https://gitlab.cigai.cn:1443/",
     "saved-token",

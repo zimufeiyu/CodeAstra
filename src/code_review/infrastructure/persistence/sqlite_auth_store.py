@@ -43,11 +43,7 @@ class SQLiteAuthStore:
                       u.password_changed_at
                FROM auth_sessions s JOIN users u ON u.user_id=s.user_id
                WHERE s.token_hash=? AND s.expires_at>? AND u.is_active=1
-                 AND s.session_id = (
-                     SELECT latest.session_id FROM auth_sessions AS latest
-                     WHERE latest.user_id=s.user_id
-                     ORDER BY latest.created_at DESC, latest.session_id DESC LIMIT 1
-                 )""",
+            """,
             (self._hash(token), now.isoformat()),
         ).fetchone()
         if row is None:
@@ -70,7 +66,6 @@ class SQLiteAuthStore:
         expires = now + timedelta(hours=12)
         session_id = uuid.uuid4().hex
         with self.connection:
-            self.connection.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
             self.connection.execute(
                 "INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (session_id, user_id, self._hash(token), self._hash(csrf_token),
@@ -81,14 +76,49 @@ class SQLiteAuthStore:
             expires_at=expires, last_seen_at=now,
         )
 
+    async def create_single_session(
+        self, user_id: str, token: str, csrf_token: str
+    ) -> AuthSession:
+        now = datetime.now(UTC)
+        expires = now + timedelta(hours=12)
+        session_id = uuid.uuid4().hex
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
+            self.connection.execute(
+                "INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    user_id,
+                    self._hash(token),
+                    self._hash(csrf_token),
+                    now.isoformat(),
+                    expires.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return AuthSession(
+            session_id=session_id,
+            user_id=user_id,
+            created_at=now,
+            expires_at=expires,
+            last_seen_at=now,
+        )
+
     async def list_user_sessions(self, user_id: str) -> list[AuthSession]:
         now = datetime.now(UTC)
         with self.connection:
-            self.connection.execute("DELETE FROM auth_sessions WHERE expires_at<=?", (now.isoformat(),))
+            self.connection.execute(
+                "DELETE FROM auth_sessions WHERE expires_at<=?", (now.isoformat(),)
+            )
         rows = self.connection.execute(
             """SELECT session_id, user_id, created_at, expires_at, last_seen_at
                FROM auth_sessions WHERE user_id=?
-               ORDER BY created_at DESC, session_id DESC LIMIT 1""",
+               ORDER BY created_at DESC, session_id DESC""",
             (user_id,),
         ).fetchall()
         return [
@@ -173,7 +203,11 @@ class SQLiteAuthStore:
                       COALESCE(SUM(CASE WHEN is_active=0 THEN 1 ELSE 0 END),0) AS disabled
                FROM users"""
         ).fetchone()
-        return UserStats(total=int(row["total"]), active=int(row["active"]), disabled=int(row["disabled"]))
+        return UserStats(
+            total=int(row["total"]),
+            active=int(row["active"]),
+            disabled=int(row["disabled"]),
+        )
 
     async def set_user_active(self, user_id: str, active: bool) -> AuthUser:
         self.connection.execute(

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from code_review.api import dependencies
 from code_review.api.auth_routes import create_auth_router
 from code_review.application.auth_service import AuthService
+from code_review.application.health_service import GatewayHealthService
 from code_review.config.settings import GatewaySettings
 from code_review.infrastructure.persistence.sqlite_auth_migration import migrate_auth_schema
 from code_review.infrastructure.persistence.sqlite_auth_store import SQLiteAuthStore
@@ -67,3 +68,36 @@ async def test_router_binds_each_local_profile_to_its_own_model(monkeypatch):
     qwen8 = service._services["local-qwen3-8b"]
     qwen32 = service._services["local-qwen3-32b"]
     assert qwen8._registry.snapshot()[0].endpoint == "http://127.0.0.1:30000"
+    assert qwen32._registry.snapshot()[0].endpoint == "http://127.0.0.1:30001"
+    lease = await qwen8._registry.acquire(estimated_tokens=10, prompt_tokens=4)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+    ) as client:
+        states = await GatewayHealthService(service.profile_registries, client).snapshot()
+    by_id = {item.endpoint_id: item for item in states}
+    assert {"local-qwen3-8b-0", "local-qwen3-32b-0"} <= set(by_id)
+    assert "deepseek-api-0" in by_id
+    assert by_id["local-qwen3-8b-0"].inflight_requests == 1
+    assert by_id["local-qwen3-32b-0"].inflight_requests == 0
+    await qwen8._registry.release_neutral(lease)
+
+
+@pytest.mark.asyncio
+async def test_health_marks_an_unlistening_local_profile_unavailable(monkeypatch):
+    settings = local_settings()
+    monkeypatch.setattr(dependencies, "get_settings", lambda: settings)
+    dependencies.get_inference_service.cache_clear()
+    service = dependencies.get_inference_service()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.port == 30000:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        states = await GatewayHealthService(service.profile_registries, client).snapshot()
+
+    by_id = {item.endpoint_id: item for item in states}
+    assert by_id["local-qwen3-8b-0"].available is False
+    assert by_id["local-qwen3-8b-0"].reason_code == "connection_refused"
+    assert by_id["local-qwen3-32b-0"].available is True

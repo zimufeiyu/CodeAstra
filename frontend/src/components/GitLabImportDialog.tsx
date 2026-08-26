@@ -1,221 +1,28 @@
 import { GitMerge, LoaderCircle, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-
-import {
-  GitLabFileChange,
-  GitLabMergeRequestPreview,
-  previewGitLabMergeRequest,
-} from "../api/client";
+import { GitLabFileChange, GitLabMergeRequestPreview, previewGitLabMergeRequest } from "../api/client";
 import type { SavedGitLabAccount } from "../utils/gitlabAccounts";
+import { GitLabBranch, GitLabMergeRequestListItem, GitLabProject, assertNotGitLabBranchTreeUrl, getGitLabCurrentUser, gitLabOAuthConfigured, listGitLabBranches, listGitLabMergeRequests, listGitLabProjects, previewGitLabMergeRequestBrowser, previewGitLabProjectMergeRequest } from "../utils/gitlabOAuth";
 
-type Props = {
-  open: boolean;
-  accounts?: SavedGitLabAccount[];
-  activeAccountId?: string | null;
-  onClose: () => void;
-  onConnectAccount?: () => void;
-  onImport: (preview: GitLabMergeRequestPreview, files: GitLabFileChange[]) => void;
-};
-
+type Props = { open: boolean; accounts?: SavedGitLabAccount[]; activeAccountId?: string | null; onClose: () => void; onConnectAccount?: () => void; oauthToken?: string | null; onOAuthConnect?: () => void; oauthError?: string; onImport: (preview: GitLabMergeRequestPreview, files: GitLabFileChange[]) => void };
 const EMPTY_ACCOUNTS: SavedGitLabAccount[] = [];
+const changeLabels: Record<GitLabFileChange["change_type"], string> = { added: "新增", modified: "修改", deleted: "删除", renamed: "重命名" };
+function structureSummary(content: string | null): string { if (!content) return "无可解析的新版本"; return `函数 ${(content.match(/\b(?:async\s+)?def\s+[A-Za-z_]\w*/g) ?? []).length} · 类 ${(content.match(/\bclass\s+[A-Za-z_]\w*/g) ?? []).length} · 导入 ${(content.match(/^\s*(?:from\s+\S+\s+)?import\s+/gm) ?? []).length}`; }
 
-const changeLabels: Record<GitLabFileChange["change_type"], string> = {
-  added: "新增",
-  modified: "修改",
-  deleted: "删除",
-  renamed: "重命名",
-};
-
-export function GitLabImportDialog({
-  open,
-  accounts = EMPTY_ACCOUNTS,
-  activeAccountId = null,
-  onClose,
-  onConnectAccount,
-  onImport,
-}: Props) {
-  const [url, setUrl] = useState("");
-  const [token, setToken] = useState("");
-  const [accountId, setAccountId] = useState(activeAccountId ?? "");
-  const [preview, setPreview] = useState<GitLabMergeRequestPreview | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [activePath, setActivePath] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const requestControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    if (!open) {
-      requestControllerRef.current?.abort();
-      requestControllerRef.current = null;
-      setToken("");
-      setBusy(false);
-      return;
-    }
-    setPreview(null);
-    setSelected(new Set());
-    setActivePath("");
-    setAccountId(
-      activeAccountId && accounts.some((item) => item.account_id === activeAccountId)
-        ? activeAccountId
-        : "",
-    );
-    setError("");
-    return () => {
-      requestControllerRef.current?.abort();
-      requestControllerRef.current = null;
-    };
-  }, [open, activeAccountId, accounts]);
-
-  const selectedAccount = accounts.find((item) => item.account_id === accountId) ?? null;
-
-  const activeFile = useMemo(
-    () => preview?.files.find((file) => file.new_path === activePath || file.old_path === activePath) ?? preview?.files[0],
-    [activePath, preview],
-  );
-
+export function GitLabImportDialog({ open, accounts = EMPTY_ACCOUNTS, activeAccountId = null, onClose, onConnectAccount, oauthToken = null, onOAuthConnect, oauthError = "", onImport }: Props) {
+  const [mode, setMode] = useState<"browser" | "url">(oauthToken ? "browser" : "url");
+  const [url, setUrl] = useState(""); const [token, setToken] = useState(""); const [accountId, setAccountId] = useState(activeAccountId ?? ""); const [user, setUser] = useState<{ username: string; name: string } | null>(null); const [projects, setProjects] = useState<GitLabProject[]>([]); const [project, setProject] = useState<GitLabProject | null>(null); const [branches, setBranches] = useState<GitLabBranch[]>([]); const [mrs, setMrs] = useState<GitLabMergeRequestListItem[]>([]); const [projectSearch, setProjectSearch] = useState(""); const [mrSearch, setMrSearch] = useState(""); const [mrState, setMrState] = useState("opened"); const [projectPage, setProjectPage] = useState(1); const [mrPage, setMrPage] = useState(1); const [preview, setPreview] = useState<GitLabMergeRequestPreview | null>(null); const [selected, setSelected] = useState<Set<string>>(new Set()); const [activePath, setActivePath] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const requestControllerRef = useRef<AbortController | null>(null);
+  const selectedAccount = accounts.find((item) => item.account_id === accountId) ?? null; const activeFile = useMemo(() => preview?.files.find((file) => file.new_path === activePath || file.old_path === activePath) ?? preview?.files[0], [activePath, preview]); const chosenFiles = preview?.files.filter((file) => file.selectable && selected.has(file.new_path)) ?? [];
+  useEffect(() => { if (!open) { requestControllerRef.current?.abort(); setBusy(false); setToken(""); return; } setAccountId(activeAccountId ?? ""); setMode(oauthToken ? "browser" : "url"); setPreview(null); setError(""); setProject(null); setBranches([]); setMrs([]); setProjects([]); setUser(null); setProjectPage(1); setMrPage(1); }, [open, oauthToken, activeAccountId]);
+  useEffect(() => { if (!open || !oauthToken || mode !== "browser") return; const controller = new AbortController(); requestControllerRef.current = controller; setBusy(true); Promise.all([getGitLabCurrentUser(controller.signal), listGitLabProjects(projectPage, projectSearch, controller.signal)]).then(([profile, items]) => { if (!controller.signal.aborted) { setUser(profile); setProjects((current) => projectPage === 1 ? items : [...current, ...items.filter((item) => !current.some((old) => old.id === item.id))]); } }).catch((reason) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "无法读取 GitLab 项目。"); }).finally(() => { if (!controller.signal.aborted) setBusy(false); }); return () => controller.abort(); }, [open, oauthToken, mode, projectPage]);
+  useEffect(() => { if (!project || !oauthToken || mode !== "browser") return; const controller = new AbortController(); requestControllerRef.current = controller; setBusy(true); Promise.all([listGitLabBranches(project.id, 1, "", controller.signal), listGitLabMergeRequests(project.id, mrPage, mrSearch, mrState, controller.signal)]).then(([branchItems, mrItems]) => { if (!controller.signal.aborted) { setBranches(branchItems); setMrs((current) => mrPage === 1 ? mrItems : [...current, ...mrItems.filter((item) => !current.some((old) => old.iid === item.iid))]); } }).catch((reason) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "无法读取项目分支或合并请求。"); }).finally(() => { if (!controller.signal.aborted) setBusy(false); }); return () => controller.abort(); }, [project, oauthToken, mode, mrPage, mrSearch, mrState]);
   if (!open) return null;
-
-  async function loadPreview(event: FormEvent) {
-    event.preventDefault();
-    requestControllerRef.current?.abort();
-    const controller = new AbortController();
-    requestControllerRef.current = controller;
-    setBusy(true);
-    setError("");
-    if (selectedAccount) {
-      try {
-        if (new URL(url.trim()).origin !== selectedAccount.gitlab_host) {
-          setError("MR 地址与所选 GitLab 账户不属于同一个服务。");
-          setBusy(false);
-          return;
-        }
-      } catch {
-        setError("请输入完整的 GitLab Merge Request 地址。");
-        setBusy(false);
-        return;
-      }
-    }
-    try {
-      const request = previewGitLabMergeRequest(
-        url.trim(),
-        selectedAccount?.private_token ?? token,
-        controller.signal,
-      );
-      if (!selectedAccount) setToken("");
-      const result = await request;
-      const available = result.files.filter((file) => file.selectable);
-      setPreview(result);
-      setSelected(new Set(available.map((file) => file.new_path)));
-      setActivePath((available[0] ?? result.files[0])?.new_path ?? "");
-      if (!selectedAccount) setToken("");
-    } catch (requestError) {
-      if (requestError instanceof DOMException && requestError.name === "AbortError") return;
-      setError(requestError instanceof Error ? requestError.message : "无法读取 GitLab 合并请求。");
-    } finally {
-      if (requestControllerRef.current === controller) {
-        requestControllerRef.current = null;
-        setBusy(false);
-      }
-    }
-  }
-
-  function toggle(path: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }
-
-  const chosenFiles = preview?.files.filter((file) => file.selectable && selected.has(file.new_path)) ?? [];
-
-  return (
-    <div className="gitlab-dialog-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onClose();
-    }}>
-      <section className="gitlab-dialog" role="dialog" aria-modal="true" aria-labelledby="gitlab-dialog-title">
-        <header className="gitlab-dialog-header">
-          <div><p className="eyebrow">GitLab Merge Request</p><h2 id="gitlab-dialog-title">从 GitLab 导入代码</h2></div>
-          <button type="button" className="dialog-close" aria-label="关闭" onClick={onClose}><X size={18} /></button>
-        </header>
-
-        {!preview ? (
-          <form className="gitlab-connect-form" onSubmit={loadPreview}>
-            {accounts.length ? (
-              <label>使用 GitLab 账户
-                <select value={accountId} onChange={(event) => setAccountId(event.target.value)}>
-                  <option value="">不使用已保存账户</option>
-                  {accounts.map((account) => (
-                    <option value={account.account_id} key={account.account_id}>
-                      {account.name} (@{account.username}) · {account.gitlab_host}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : null}
-            <label>合并请求地址<input type="url" required value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://gitlab.example.com/group/project/-/merge_requests/12" /></label>
-            {selectedAccount ? (
-              <p className="gitlab-selected-account">使用 @{selectedAccount.username} 读取 {selectedAccount.gitlab_host}</p>
-            ) : (
-              <>
-                {onConnectAccount ? (
-                  <>
-                    <button type="button" className="gitlab-secondary" onClick={onConnectAccount}>
-                      连接 GitLab 并继续
-                    </button>
-                    <p className="gitlab-note">也可以使用下方一次性令牌，不会保存账户。</p>
-                  </>
-                ) : null}
-                <label>访问令牌（私有项目需要）<input type="password" value={token} onChange={(event) => setToken(event.target.value)} autoComplete="off" placeholder="仅用于本次读取，不会保存" /></label>
-              </>
-            )}
-            <p className="gitlab-note">使用固定的 base/head 提交读取新旧版本，避免审查期间代码发生漂移。</p>
-            {error ? <p className="gitlab-error" role="alert">{error}</p> : null}
-            <button className="gitlab-primary" type="submit" disabled={busy || !url.trim()}>
-              {busy ? <LoaderCircle className="spin" size={17} /> : <GitMerge size={17} />}
-              {busy ? "正在读取…" : "读取合并请求"}
-            </button>
-          </form>
-        ) : (
-          <>
-            <div className="gitlab-mr-summary">
-              <div><strong>{preview.title}</strong><span>{preview.project_path} · !{preview.merge_request_iid}</span></div>
-              <button type="button" className="gitlab-link-button" onClick={() => setPreview(null)}>更换地址</button>
-            </div>
-            <div className="gitlab-browser">
-              <aside className="gitlab-files" aria-label="变更文件">
-                {preview.files.map((file) => (
-                  <div className={"gitlab-file-row" + (activeFile === file ? " active" : "")} key={file.old_path + file.new_path}>
-                    <button type="button" className="gitlab-file-open" onClick={() => setActivePath(file.new_path || file.old_path)}>
-                      <strong>{file.new_path || file.old_path}</strong>
-                      <span>{changeLabels[file.change_type]}{file.language ? " · " + (file.language === "python" ? "Python" : "C/C++") : ""}</span>
-                    </button>
-                    <input type="checkbox" aria-label={"选择 " + file.new_path} checked={selected.has(file.new_path)} disabled={!file.selectable} onChange={() => toggle(file.new_path)} />
-                    {!file.selectable && file.unavailable_reason ? <small>{file.unavailable_reason}</small> : null}
-                  </div>
-                ))}
-              </aside>
-              <section className="gitlab-diff-preview">
-                {activeFile ? (
-                  <>
-                    <div className="gitlab-diff-heading"><strong>{activeFile.new_path || activeFile.old_path}</strong>{activeFile.diff_truncated ? <span>差异过大，预览已截断</span> : null}</div>
-                    <div className="gitlab-code-columns">
-                      <div><span>修改前 · {preview.base_sha.slice(0, 8)}</span><pre>{activeFile.old_content ?? "（无旧版本）"}</pre></div>
-                      <div><span>修改后 · {preview.head_sha.slice(0, 8)}</span><pre>{activeFile.new_content ?? "（无新版本）"}</pre></div>
-                    </div>
-                  </>
-                ) : <p className="gitlab-empty">此合并请求没有可预览的文件。</p>}
-              </section>
-            </div>
-            <footer className="gitlab-dialog-footer">
-              <span>已选择 {chosenFiles.length} 个可审查文件</span>
-              <div><button type="button" className="gitlab-secondary" onClick={onClose}>取消</button><button type="button" className="gitlab-primary" disabled={!chosenFiles.length} onClick={() => onImport(preview, chosenFiles)}>添加到审查</button></div>
-            </footer>
-          </>
-        )}
-      </section>
-    </div>
-  );
+  async function loadUrlPreview(event: FormEvent) { event.preventDefault(); requestControllerRef.current?.abort(); const controller = new AbortController(); requestControllerRef.current = controller; setBusy(true); setError(""); try { assertNotGitLabBranchTreeUrl(url.trim()); const result = oauthToken ? await previewGitLabMergeRequestBrowser(url.trim(), controller.signal) : await previewGitLabMergeRequest(url.trim(), selectedAccount?.private_token ?? token, controller.signal); setPreview(result); setSelected(new Set(result.files.filter((file) => file.selectable).map((file) => file.new_path))); setActivePath(result.files[0]?.new_path ?? ""); } catch (reason) { if (!(reason instanceof DOMException && reason.name === "AbortError")) setError(reason instanceof Error ? reason.message : "无法读取 GitLab 合并请求。"); } finally { if (requestControllerRef.current === controller) { requestControllerRef.current = null; setBusy(false); } } }
+  async function selectMr(item: GitLabMergeRequestListItem) { if (!project) return; setBusy(true); setError(""); try { const result = await previewGitLabProjectMergeRequest(project.id, item.iid); setPreview(result); setSelected(new Set(result.files.filter((file) => file.selectable).map((file) => file.new_path))); setActivePath(result.files[0]?.new_path ?? ""); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取合并请求变更。"); } finally { setBusy(false); } }
+  function toggle(path: string) { setSelected((current) => { const next = new Set(current); if (next.has(path)) next.delete(path); else next.add(path); return next; }); }
+  const browserHome = <div className="gitlab-connect-form"><p className="gitlab-selected-account">管理员已配置一次 CodeAstra OAuth 应用；普通用户无需创建 Applications，只需点击授权。{user ? ` 当前用户：${user.name || user.username}` : ""}</p>{!project ? <><label>搜索项目<input aria-label="搜索项目" value={projectSearch} onChange={(event) => { setProjectSearch(event.target.value); setProjectPage(1); }} placeholder="按项目名称或路径搜索" /></label><div className="gitlab-project-list" aria-label="项目列表">{projects.map((item) => <button type="button" className="gitlab-project-row" key={item.id} onClick={() => setProject(item)}><strong>{item.path_with_namespace}</strong><span>{item.default_branch ? `默认分支：${item.default_branch}` : "未设置默认分支"}</span></button>)}{!projects.length && !busy ? <p className="gitlab-empty">没有可访问的项目。</p> : null}</div><div className="gitlab-dialog-footer"><button type="button" className="gitlab-secondary" onClick={() => setProjectPage((page) => page + 1)}>加载更多项目</button><button type="button" className="gitlab-link-button" onClick={() => setMode("url")}>高级：粘贴 MR 地址</button></div></> : <><div className="gitlab-mr-summary"><div><strong>{project.path_with_namespace}</strong><span>{branches.length ? `分支：${branches.map((branch) => branch.name).join("、")}` : "正在读取分支"}</span></div><button type="button" className="gitlab-link-button" onClick={() => setProject(null)}>更换项目</button></div><label>搜索 Merge Request<input aria-label="搜索 Merge Request" value={mrSearch} onChange={(event) => { setMrSearch(event.target.value); setMrPage(1); }} placeholder="按标题搜索" /></label><label>状态<select aria-label="MR 状态" value={mrState} onChange={(event) => { setMrState(event.target.value); setMrPage(1); }}><option value="opened">开放</option><option value="merged">已合并</option><option value="closed">已关闭</option><option value="all">全部</option></select></label><div className="gitlab-project-list" aria-label="Merge Request 列表">{mrs.map((item) => <button type="button" className="gitlab-project-row" key={item.iid} onClick={() => void selectMr(item)}><strong>!{item.iid} · {item.title}</strong><span>{item.source_branch} → {item.target_branch} · {item.state}</span></button>)}{!mrs.length && !busy ? <p className="gitlab-empty">没有匹配的 Merge Request。</p> : null}</div><button type="button" className="gitlab-secondary" onClick={() => setMrPage((page) => page + 1)}>加载更多 MR</button></>}</div>;
+  const oauthConfigured = gitLabOAuthConfigured();
+  const urlHome = <form className="gitlab-connect-form" onSubmit={loadUrlPreview}><div className="gitlab-oauth-entry"><strong>推荐：使用 OAuth 连接 GitLab</strong><p className="gitlab-note">管理员只需配置一次 Public/PKCE 应用；普通用户点击授权即可，无需填写 Application ID 或 Secret。</p>{oauthToken ? <button type="button" className="gitlab-secondary" onClick={() => setMode("browser")}>返回项目浏览器</button> : onOAuthConnect && oauthConfigured ? <button type="button" className="gitlab-secondary" onClick={onOAuthConnect}>连接 GitLab（推荐）</button> : <p className="gitlab-error" role="alert">管理员尚未配置 GitLab OAuth，暂时无法使用推荐连接方式。请联系管理员配置公开 Client ID 和允许的回调地址。</p>}</div><p className="gitlab-note">高级入口仅接受包含 /-/merge_requests/ 的 MR 地址，不接受 /-/tree/ 分支树地址。</p>{selectedAccount ? <p className="gitlab-note">旧 PAT 账户属于其他连接方式：当前使用 @{selectedAccount.username} 读取 {selectedAccount.gitlab_host}</p> : null}<label>合并请求地址<input type="url" required value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://gitlab.example.com/group/project/-/merge_requests/12" /></label>{oauthToken || selectedAccount ? null : <label>访问令牌（旧版兼容方式）<input type="password" value={token} onChange={(event) => setToken(event.target.value)} autoComplete="off" /></label>}{onConnectAccount ? <button type="button" className="gitlab-link-button" onClick={onConnectAccount}>管理旧版 GitLab 账户</button> : null}<button className="gitlab-primary" type="submit" disabled={busy || !url.trim()}>{busy ? <LoaderCircle className="spin" size={17} /> : <GitMerge size={17} />}{busy ? "正在读取…" : "读取合并请求"}</button></form>;
+  const browserPreview = preview ? <><div className="gitlab-mr-summary"><div><strong>{preview.title}</strong><span>{preview.project_path} · !{preview.merge_request_iid} · base {preview.base_sha.slice(0, 8)} → head {preview.head_sha.slice(0, 8)}</span></div><button type="button" className="gitlab-link-button" onClick={() => setPreview(null)}>返回选择</button></div><div className="gitlab-browser"><aside className="gitlab-files" aria-label="变更文件树">{preview.files.map((file) => <div className={"gitlab-file-row" + (activeFile === file ? " active" : "")} key={file.old_path + file.new_path}><button type="button" className="gitlab-file-open" onClick={() => setActivePath(file.new_path || file.old_path)}><strong>{file.new_path || file.old_path}</strong><span>{changeLabels[file.change_type]} · {file.language ?? "未知语言"}</span></button><input type="checkbox" aria-label={`选择 ${file.new_path || file.old_path}`} checked={selected.has(file.new_path)} disabled={!file.selectable} onChange={() => toggle(file.new_path)} />{!file.selectable && file.unavailable_reason ? <small>{file.unavailable_reason}</small> : null}</div>)}</aside><section className="gitlab-diff-preview">{activeFile ? <><div className="gitlab-diff-heading"><strong>{activeFile.new_path || activeFile.old_path}</strong><span>结构摘要：{structureSummary(activeFile.new_content)}</span></div><div className="gitlab-code-columns"><div><span>修改前 · {preview.base_sha.slice(0, 8)}</span><pre>{activeFile.old_content ?? "（无旧版本）"}</pre></div><div><span>修改后 · {preview.head_sha.slice(0, 8)}</span><pre>{activeFile.new_content ?? "（无新版本）"}</pre></div></div><pre className="gitlab-unified-diff">{activeFile.diff || "（无统一 diff）"}</pre></> : <p className="gitlab-empty">请选择变更文件。</p>}</section></div><footer className="gitlab-dialog-footer"><span>已选择 {chosenFiles.length} 个可审查文件 · project_id {preview.project_id}</span><div><button type="button" className="gitlab-secondary" onClick={onClose}>取消</button><button type="button" className="gitlab-primary" disabled={!chosenFiles.length} onClick={() => onImport(preview, chosenFiles)}>添加到审查</button></div></footer></> : null;
+  return <div className="gitlab-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="gitlab-dialog" role="dialog" aria-modal="true" aria-labelledby="gitlab-dialog-title"><header className="gitlab-dialog-header"><div><p className="eyebrow">GitLab 浏览器导入</p><h2 id="gitlab-dialog-title">从 GitLab 导入代码</h2></div><button type="button" className="dialog-close" aria-label="关闭" onClick={onClose}><X size={18} /></button></header>{oauthError || error ? <p className="gitlab-error" role="alert">{oauthError || error}</p> : null}{browserPreview || (!preview && oauthToken && mode === "browser" ? browserHome : urlHome)}</section></div>;
 }

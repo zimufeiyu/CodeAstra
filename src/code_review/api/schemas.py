@@ -31,6 +31,8 @@ class InstanceHealth(BaseModel):
     inflight_requests: int = Field(ge=0)
     inflight_tokens: int = Field(ge=0)
     circuit_open: bool
+    available: bool
+    reason_code: str | None = None
 
 
 class GatewayHealthResponse(BaseModel):
@@ -79,7 +81,37 @@ class FollowupContextInput(BaseModel):
 class FollowupRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     context: FollowupContextInput | None = None
+    base_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class FollowupFixPreviewRequest(BaseModel):
+    instruction: str = Field(min_length=1, max_length=2000)
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context: FollowupContextInput
 
 
 class FindingDecisionRequest(BaseModel):
-    decision: Literal["apply", "keep"]
+    decision: Literal["accepted_risk", "deferred", "dismissed"]
+
+
+class FixCandidateRequest(BaseModel):
+    candidate_id: str = Field(min_length=1, max_length=100)
+
+
+class RepairIntentRequest(BaseModel):
+    review_id: str = Field(min_length=1, max_length=100)
+    finding_id: str = Field(min_length=1, max_length=100)
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    option_id: str = Field(min_length=1, max_length=300)
+    intent_kind: Literal[
+        "rename_existing",
+        "declare_parameter",
+        "declare_local",
+        "import_symbol",
+        "custom_behavior",
+        "defer",
+    ]
+    selected_symbol: str | None = Field(default=None, max_length=300)
+    import_source: str | None = Field(default=None, max_length=500)
+    initializer: str | None = Field(default=None, max_length=1000)
+    user_intent: str | None = Field(default=None, min_length=1, max_length=2000)

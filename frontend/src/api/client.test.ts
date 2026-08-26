@@ -133,7 +133,7 @@ describe("review API client", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      decideReviewFinding("review-1", "finding-1", "apply"),
+      decideReviewFinding("review-1", "finding-1", "accepted_risk"),
     ).rejects.toMatchObject({ status: 502, message: detail });
   });
 

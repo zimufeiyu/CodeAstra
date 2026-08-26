@@ -17,7 +17,9 @@ import "./styles.css";
 import "./desktopLayout.css";
 import {
   GatewayHealthResponse,
+  ApiError,
   FollowupMessage,
+  FixCandidate,
   ModelProfile,
   ReviewHistoryItem,
   ReviewRevision,
@@ -28,12 +30,17 @@ import {
   LocalDiffPreview,
   ReviewFilePayload,
   ReviewOrigin,
+  RepairIntentOption,
   SessionFinding,
+  UseDefEvidence,
   cancelReviewSession,
+  cancelReviewFix,
   askReviewFollowup,
   createReviewSession,
+  confirmReviewFix,
   decideReviewFinding,
   deleteReviewSession,
+  downloadArtifact,
   getInstanceHealth,
   getModelProfiles,
   getDeepSeekModels,
@@ -41,7 +48,10 @@ import {
   getReviewSession,
   getReviewRevisions,
   listReviewSessions,
+  previewReviewFix,
+  previewReviewFixWithIntent,
   renameReviewSession,
+  reopenReviewFinding,
   resumeReviewSession,
   streamReviewSession,
   undoReviewRevision,
@@ -52,6 +62,8 @@ import type { CodeSelection } from "./components/CodeViewer";
 import { FollowupContext, FollowupDialog } from "./components/FollowupDialog";
 import { HistorySidebar } from "./components/HistorySidebar";
 import { RevisionHistoryDialog } from "./components/RevisionHistoryDialog";
+import { FixPreviewDialog } from "./components/FixPreviewDialog";
+import { RepairIntentDialog } from "./components/RepairIntentDialog";
 import { AttachmentMenu } from "./components/AttachmentMenu";
 import { GitLabAccountManagement } from "./components/GitLabAccountDialog";
 import { AccountSecurityPanel } from "./auth/AccountSecurityPanel";
@@ -71,8 +83,15 @@ import {
   replaceGitLabAttachments,
   replaceLocalDiffAttachments,
 } from "./utils/gitlabAttachments";
-import { detectLanguage } from "./utils/languageDetector";
+import {
+  detectLanguage,
+  duplicateCanonicalPaths,
+  readSourceFileStrict,
+  uniqueSnippetFilename,
+  validateSourceText,
+} from "./utils/languageDetector";
 import { loadDeepSeekSettings, persistDeepSeekSettings } from "./utils/deepseekSettings";
+import { beginGitLabOAuth, consumeGitLabOAuthCallback, defaultGitLabRedirectUri, hasGitLabOAuthToken } from "./utils/gitlabOAuth";
 
 const severityLabels: Record<SessionFinding["severity"], string> = {
   critical: "严重",
@@ -103,6 +122,10 @@ const fallbackModelProfiles: ModelProfile[] = [
     requires_user_api_key: true,
   },
 ];
+
+const MAX_SOURCE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_REVIEW_SOURCE_BYTES = 8 * 1024 * 1024;
+const HISTORY_PAGE_SIZE = 50;
 
 type DraftAttachment = {
   id: string;
@@ -145,6 +168,16 @@ function removeOriginPaths(
   };
 }
 
+export function repairFailureMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError && error.code === "scope_mismatch") {
+    return "系统无法安全定位替换边界，未生成修改候选，原代码未改变。";
+  }
+  if (error instanceof ApiError && error.code === "model_output_invalid") {
+    return "模型返回的修改内容无效，未生成修改候选，原代码未改变。";
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
 type ReviewProgress = {
   total: number;
   completed: number;
@@ -155,11 +188,29 @@ type ReviewProgress = {
   active_file?: string;
 };
 
+const decisionLabels = {
+  fixed: "已修复",
+  accepted_risk: "接受风险",
+  deferred: "待处理",
+  dismissed: "已驳回",
+} as const;
+
+export function parseReviewRoute(pathname: string): { reviewId: string; findingId?: string } | null {
+  const match = pathname.match(/^\/reviews\/([^/]+)(?:\/findings\/([^/]+))?\/?$/);
+  if (!match) return null;
+  return {
+    reviewId: decodeURIComponent(match[1]),
+    findingId: match[2] ? decodeURIComponent(match[2]) : undefined,
+  };
+}
+
 function App() {
   const authSession = useOptionalAuthSession();
   const [draftCode, setDraftCode] = useState("");
   const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
   const [gitLabDialogOpen, setGitLabDialogOpen] = useState(false);
+  const [gitLabOAuthToken, setGitLabOAuthToken] = useState<string | null>(null);
+  const [gitLabOAuthError, setGitLabOAuthError] = useState("");
   const [localDiffDialogOpen, setLocalDiffDialogOpen] = useState(false);
   const [resumeGitLabImportAfterAccount, setResumeGitLabImportAfterAccount] = useState(false);
   const [gitLabAccounts, setGitLabAccounts] = useState<SavedGitLabAccount[]>(
@@ -171,6 +222,10 @@ function App() {
   const [reviewOrigin, setReviewOrigin] = useState<ReviewOrigin | null>(null);
   const [localDiffBaseFiles, setLocalDiffBaseFiles] = useState<ReviewFilePayload[]>([]);
   const [historyItems, setHistoryItems] = useState<ReviewHistoryItem[]>([]);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [historyRetryReset, setHistoryRetryReset] = useState(false);
   const [followups, setFollowups] = useState<FollowupMessage[]>([]);
   const [followupBusy, setFollowupBusy] = useState(false);
   const [followupError, setFollowupError] = useState("");
@@ -178,11 +233,19 @@ function App() {
   const [runningReviewId, setRunningReviewId] = useState<string | null>(null);
   const [viewedReviewId, setViewedReviewId] = useState<string | null>(null);
   const [fixBusyId, setFixBusyId] = useState<string | null>(null);
+  const [fixCandidate, setFixCandidate] = useState<FixCandidate | null>(null);
+  const [repairIntent, setRepairIntent] = useState<{
+    finding: SessionFinding;
+    evidence: UseDefEvidence;
+    baseSha: string;
+  } | null>(null);
+  const [fixConfirmationBusy, setFixConfirmationBusy] = useState(false);
   const [revisionDialogOpen, setRevisionDialogOpen] = useState(false);
   const [revisions, setRevisions] = useState<ReviewRevision[]>([]);
   const [revisionBusyId, setRevisionBusyId] = useState<string | null>(null);
   const [session, setSession] = useState<ReviewSession | null>(null);
   const [health, setHealth] = useState<GatewayHealthResponse | null>(null);
+  const [healthUnavailable, setHealthUnavailable] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(
     fallbackModelProfiles,
   );
@@ -198,15 +261,28 @@ function App() {
   const [isReviewing, setIsReviewing] = useState(false);
   const [stageMessage, setStageMessage] = useState("");
   const [progress, setProgress] = useState<ReviewProgress | null>(null);
+  const [disconnectedReviewId, setDisconnectedReviewId] = useState<string | null>(null);
+  const [artifactBusyKey, setArtifactBusyKey] = useState<string | null>(null);
+  const [artifactState, setArtifactState] = useState<{
+    key: string;
+    path: string;
+    fallback: string;
+    label: string;
+    message: string;
+    error: boolean;
+  } | null>(null);
+  const [reopenBusyId, setReopenBusyId] = useState<string | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const fixPreviewControllerRef = useRef<AbortController | null>(null);
   const reviewIdRef = useRef<string | null>(null);
   const viewedReviewIdRef = useRef<string | null>(null);
   const followupContextIdentityRef = useRef<string | null>(null);
   const followupLoadSequenceRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const stoppedControllersRef = useRef(new WeakSet<AbortController>());
+  const historyLoadingRef = useRef(false);
 
   function viewReview(reviewId: string | null) {
     viewedReviewIdRef.current = reviewId;
@@ -216,24 +292,56 @@ function App() {
   useEffect(() => {
     let ignore = false;
     let refreshTimer: number | undefined;
+    const schedule = () => {
+      if (ignore) return;
+      const delay = document.hidden ? 30_000 : isReviewing ? 1_000 : 5_000;
+      refreshTimer = window.setTimeout(() => void refreshHealth(), delay);
+    };
     async function refreshHealth() {
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
       try {
         const snapshot = await getInstanceHealth();
-        if (!ignore) setHealth(snapshot);
+        if (!ignore) {
+          setHealth(snapshot);
+          setHealthUnavailable(false);
+        }
       } catch {
-        if (!ignore) setHealth({ instances: [] });
+        if (!ignore) setHealthUnavailable(true);
       } finally {
-        if (!ignore) refreshTimer = window.setTimeout(refreshHealth, 1000);
+        schedule();
       }
     }
+    const handleVisibility = () => {
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      if (document.hidden) schedule();
+      else void refreshHealth();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
     void refreshHealth();
     return () => {
       ignore = true;
+      document.removeEventListener("visibilitychange", handleVisibility);
       if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
     };
+  }, [isReviewing, selectedModelProfileId, session?.model.profile_id]);
+  useEffect(() => {
+    void consumeGitLabOAuthCallback()
+      .then((token) => {
+        if (token) {
+          setGitLabOAuthToken(token);
+          setGitLabDialogOpen(true);
+          window.history.replaceState({}, document.title, window.location.pathname);
+        } else if (hasGitLabOAuthToken()) {
+          setGitLabOAuthToken("active");
+        }
+      })
+      .catch((callbackError) => setGitLabOAuthError(callbackError instanceof Error ? callbackError.message : "GitLab 授权失败，请重试。"));
   }, []);
+
   useEffect(() => {
     void openHistory();
+    const route = parseReviewRoute(window.location.pathname);
+    if (route) void openHistorySession(route.reviewId, route.findingId, false);
     const profilesRequest = typeof getModelProfiles === "function"
       ? getModelProfiles()
       : Promise.resolve(fallbackModelProfiles);
@@ -247,6 +355,28 @@ function App() {
         );
       })
       .catch(() => setModelProfiles(fallbackModelProfiles));
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const route = parseReviewRoute(window.location.pathname);
+      if (route) {
+        void openHistorySession(route.reviewId, route.findingId, false);
+        return;
+      }
+      abortControllerRef.current?.abort();
+      viewReview(null);
+      setSession(null);
+      setFollowupContext(null);
+      setError("");
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => () => {
+    abortControllerRef.current?.abort();
+    fixPreviewControllerRef.current?.abort();
   }, []);
 
 
@@ -281,38 +411,125 @@ function App() {
     (item) => item.profile_id === activeModel.profile_id,
   ) ?? selectedModelProfile;
 
+  const activeHealthInstances = useMemo(() => {
+    if (!health) return [];
+    const prefix = activeModel.provider === "deepseek"
+      ? "deepseek-api-"
+      : `${activeModel.profile_id}-`;
+    return health.instances.filter((item) => item.endpoint_id.startsWith(prefix));
+  }, [activeModel.profile_id, activeModel.provider, health]);
+
   const healthSummary = useMemo(() => {
     if (activeModel.provider === "deepseek") {
       if (!activeModelProfile.available) return "未配置";
       if (!deepSeekSettings.apiKey) return "待填写密钥";
       if (validatedDeepSeekKey !== deepSeekSettings.apiKey) return "待验证";
-      return isReviewing ? "API 调用中" : "API 可用";
     }
+    if (healthUnavailable) return "状态暂不可用";
     if (!health) return "连接中";
-    if (health.instances.length === 0) return "未连接";
-    if (health.instances.some((item) => item.circuit_open)) return "熔断";
-    if (isReviewing || health.instances.some((item) => item.inflight_requests > 0)) {
+    if (activeHealthInstances.length === 0) return "未连接";
+    if (activeHealthInstances.some((item) => item.available === false)) {
+      return activeHealthInstances.every((item) => item.reason_code === "circuit_open")
+        ? "恢复中"
+        : "未运行";
+    }
+    if (activeHealthInstances.some((item) => item.circuit_open)) return "熔断";
+    if (isReviewing || activeHealthInstances.some((item) => item.inflight_requests > 0)) {
       return "使用中";
     }
     return "可用";
-  }, [activeModel.provider, activeModelProfile.available, deepSeekSettings.apiKey, validatedDeepSeekKey, health, isReviewing]);
+  }, [activeHealthInstances, activeModel.provider, activeModelProfile.available, deepSeekSettings.apiKey, health, healthUnavailable, isReviewing, validatedDeepSeekKey]);
+
+  const localHealthDetail = useMemo(() => {
+    if (!health) return null;
+    const profiles = [
+      ["local-qwen3-8b-", "Qwen3-8B"],
+      ["local-qwen3-32b-", "Qwen3-32B"],
+    ] as const;
+    const details = profiles.flatMap(([prefix, label]) => {
+      const states = health.instances.filter((item) => item.endpoint_id.startsWith(prefix));
+      if (!states.length) return [];
+      const status = states.some((item) => item.available)
+        ? "可用"
+        : states.every((item) => item.reason_code === "circuit_open")
+          ? "正在恢复"
+          : states.some((item) => item.reason_code === "timeout")
+            ? "连接超时"
+            : "未运行";
+      return [`${label}（${status}）`];
+    });
+    if (!details.length || details.every((item) => item.endsWith("（可用）"))) return null;
+    return `本地模型服务未运行或正在恢复：${details.join("，")}`;
+  }, [health]);
 
   const activeFile = session?.files.find((item) => item.file_id === activeFileId) ?? session?.files[0];
   const activeFindings = session?.findings.filter((item) => item.file_id === activeFile?.file_id) ?? [];
+  const isReviewDetail = viewedReviewId !== null;
+  const draftTextError = draftCode ? validateSourceText(draftCode) : null;
+  const failedReviewUsesRecheck = session?.status === "failed";
+  const processedFindings = useMemo(() => {
+    if (!session) return [];
+    const activeIds = new Set(session.findings.map((item) => item.finding_id));
+    return Object.entries(session.finding_decisions ?? {}).flatMap(([findingId, decision]) => {
+      if (activeIds.has(findingId)) return [];
+      const finding = session.decided_findings?.[findingId];
+      if (!finding) return [];
+      const audit = [...(session.finding_decision_history ?? [])]
+        .reverse()
+        .find((item) => item.finding_id === findingId && item.action === "decided");
+      return [{ finding, decision, audit }];
+    });
+  }, [session]);
 
   async function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const selected = Array.from(event.target.files ?? []);
     if (!selected.length) return;
-    const additions = await Promise.all(
-      selected.map(async (file, index) => ({
-        id: [file.name, file.size, file.lastModified, index].join("-"),
-        filename: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
-        content: await new Response(file).text(),
-        size: file.size,
-        source: "local" as const,
-      })),
-    );
-    const selectedNames = new Set(additions.map((item) => item.filename));
+    const selectedPaths = selected.map((file) => (
+      (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+    ));
+    const selectedNames = new Set(selectedPaths);
+    const duplicatePaths = duplicateCanonicalPaths(selectedPaths);
+    if (duplicatePaths.length) {
+      setError(`存在重复或跨平台会冲突的文件路径，请重命名后重试：${duplicatePaths.join("、")}`);
+      event.target.value = "";
+      return;
+    }
+    const oversized = selected.find((file) => file.size > MAX_SOURCE_FILE_BYTES);
+    if (oversized) {
+      setError(`${oversized.name}：单个代码文件不能超过 2 MiB。`);
+      event.target.value = "";
+      return;
+    }
+    const retainedBytes = attachments
+      .filter((item) => !selectedNames.has(item.filename))
+      .reduce((total, item) => total + item.size, 0);
+    if (retainedBytes + selected.reduce((total, file) => total + file.size, 0)
+        > MAX_REVIEW_SOURCE_BYTES) {
+      setError("一次审查的代码总量不能超过 8 MiB。");
+      event.target.value = "";
+      return;
+    }
+    let additions: DraftAttachment[];
+    try {
+      additions = await Promise.all(
+        selected.map(async (file, index) => {
+          const content = await readSourceFileStrict(file);
+          const unsafeText = validateSourceText(content);
+          if (unsafeText) throw new Error(`${file.name}：${unsafeText}`);
+          return {
+            id: [file.name, file.size, file.lastModified, index].join("-"),
+            filename: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+            content,
+            size: file.size,
+            source: "local" as const,
+          };
+        }),
+      );
+    } catch (readError) {
+      setError(readError instanceof Error ? readError.message : "文件读取失败，请确认文件是 UTF-8 文本。");
+      event.target.value = "";
+      return;
+    }
     setAttachments((current) => mergeLocalAttachments(current, additions));
     setReviewOrigin((current) => removeOriginPaths(current, selectedNames));
     setLocalDiffBaseFiles((current) => current.filter((item) => !selectedNames.has(item.filename)));
@@ -435,34 +652,75 @@ function App() {
     setError("");
   }
 
-  async function openHistory() {
-    setError("");
+  async function openHistory(reset = true) {
+    if (historyLoadingRef.current) return;
+    historyLoadingRef.current = true;
+    setHistoryLoading(true);
+    setHistoryError("");
     try {
-      const result = await listReviewSessions(100);
-      setHistoryItems(result.items);
+      const offset = reset ? 0 : historyItems.length;
+      const result = await listReviewSessions(HISTORY_PAGE_SIZE, offset);
+      setHistoryItems((current) => {
+        const source = reset ? [] : current;
+        const seen = new Set(source.map((item) => item.review_id));
+        return [
+          ...source,
+          ...result.items.filter((item) => !seen.has(item.review_id)),
+        ];
+      });
+      setHistoryHasMore(result.items.length === result.limit);
+      setHistoryRetryReset(false);
     } catch (historyError) {
-      setError(
+      setHistoryRetryReset(reset);
+      setHistoryError(
         historyError instanceof Error
           ? historyError.message
           : "加载历史记录失败。",
       );
+    } finally {
+      historyLoadingRef.current = false;
+      setHistoryLoading(false);
     }
   }
 
-  async function openHistorySession(reviewId: string) {
+  async function openHistorySession(
+    reviewId: string,
+    findingId?: string,
+    updateRoute = true,
+  ) {
+    abortControllerRef.current?.abort();
     viewReview(reviewId);
+    if (updateRoute) window.history.pushState({}, "", `/reviews/${reviewId}`);
     setSession(null);
     setFollowupContext(null);
     setError("");
     try {
       const restored = await getReviewSession(reviewId);
-      if (viewedReviewIdRef.current === reviewId) displaySession(restored);
+      if (viewedReviewIdRef.current !== reviewId) return;
+      displaySession(restored);
+      const selectFinding = (result: ReviewSession) => {
+        if (!findingId) return;
+        const finding = result.findings.find((item) => item.finding_id === findingId);
+        if (finding) {
+          setActiveFileId(finding.file_id);
+          setSelectedFindingId(finding.finding_id);
+        } else {
+          setError("该问题已处理或不存在，已显示当前审查结果。");
+        }
+      };
+      selectFinding(restored);
+      if (!["completed", "failed", "cancelled"].includes(restored.status)) {
+        const completed = await attachToReview(reviewId, undefined, "正在重新连接审查进度");
+        if (completed && viewedReviewIdRef.current === reviewId) selectFinding(completed);
+      }
     } catch (historyError) {
-      setError(
-        historyError instanceof Error
-          ? historyError.message
-          : "加载审查记录失败。",
-      );
+      if (historyError instanceof DOMException && historyError.name === "AbortError") return;
+      if (viewedReviewIdRef.current === reviewId) {
+        if (historyError instanceof ApiError && historyError.code === "stream_reconnect_exhausted") {
+          setDisconnectedReviewId(reviewId);
+        }
+        setError(historyError instanceof Error ? historyError.message : "加载审查记录失败。");
+      }
     }
   }
   async function renameHistorySession(reviewId: string, title: string) {
@@ -483,6 +741,8 @@ function App() {
     try {
       await deleteReviewSession(reviewId);
       setHistoryItems((current) => current.filter((item) => item.review_id !== reviewId));
+      setHistoryHasMore(true);
+      await openHistory(true);
       if (session?.review_id === reviewId) resetWorkspace();
     } catch (historyError) {
       setError(historyError instanceof Error ? historyError.message : "删除失败，请稍后重试。");
@@ -547,17 +807,33 @@ function App() {
     setFollowupError("");
     try {
       const payload = toFollowupPayload(sourceContext);
-      const messages = session.model.provider === "deepseek"
-        ? await askReviewFollowup(sourceReviewId, question.trim(), payload, deepSeekSettings.apiKey.trim())
-        : await askReviewFollowup(sourceReviewId, question.trim(), payload);
+      const source = session.files.find((item) => item.file_id === sourceContext.fileId);
+      const result = session.model.provider === "deepseek"
+        ? await askReviewFollowup(
+            sourceReviewId,
+            question.trim(),
+            payload,
+            deepSeekSettings.apiKey.trim(),
+            source?.sha256,
+          )
+        : await askReviewFollowup(sourceReviewId, question.trim(), payload, undefined, source?.sha256);
       if (viewedReviewIdRef.current === sourceReviewId && followupContextIdentityRef.current === identity) {
-        setFollowups((current) => [...current, ...messages]);
+        if (result.action === "fix_candidate") {
+          followupLoadSequenceRef.current += 1;
+          followupContextIdentityRef.current = null;
+          setFollowupContext(null);
+          setFollowups([]);
+          setFixCandidate(result.candidate);
+          setStageMessage("候选修复已验证，等待确认");
+          return true;
+        }
+        setFollowups((current) => [...current, ...result.messages]);
         return true;
       }
       return false;
     } catch (submitError) {
       if (followupContextIdentityRef.current === identity) {
-        setFollowupError(submitError instanceof Error ? submitError.message : "发送追问失败。");
+        setFollowupError(repairFailureMessage(submitError, "发送追问失败。"));
       }
       return false;
     } finally {
@@ -594,6 +870,142 @@ function App() {
       },
       controller.signal,
     );
+  }
+
+  async function watchRecheckReview(reviewId: string, outerController: AbortController) {
+    const internalController = new AbortController();
+    const propagateAbort = () => internalController.abort();
+    outerController.signal.addEventListener("abort", propagateAbort, { once: true });
+    const terminalStatuses: ReviewSession["status"][] = ["completed", "failed", "cancelled"];
+    const waitForNextSnapshot = () => new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(resolve, 1000);
+      internalController.signal.addEventListener("abort", () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("stopped", "AbortError"));
+      }, { once: true });
+    });
+
+    const streamOutcome = watchReview(reviewId, internalController)
+      .then((result) => ({ source: "stream-result" as const, result }))
+      .catch((error: unknown) => ({ source: "stream-error" as const, error }));
+    const snapshotOutcome = (async () => {
+      let deadline = Date.now() + 65_000;
+      while (!internalController.signal.aborted) {
+        const snapshot = await getReviewSession(reviewId, internalController.signal);
+        if (terminalStatuses.includes(snapshot.status)) return snapshot;
+        if (snapshot.recheck_deadline_at) {
+          const serverDeadline = Date.parse(snapshot.recheck_deadline_at);
+          if (Number.isFinite(serverDeadline)) deadline = serverDeadline + 3_000;
+        }
+        if (Date.now() >= deadline) {
+          const finalSnapshot = await getReviewSession(reviewId, internalController.signal);
+          if (terminalStatuses.includes(finalSnapshot.status)) return finalSnapshot;
+          throw new ApiError(
+            "统一复查已超过服务器门限，修改仍已保留。请稍后点击“重新复查”。",
+            0,
+            "recheck_snapshot_timeout",
+          );
+        }
+        await waitForNextSnapshot();
+      }
+      throw new DOMException("stopped", "AbortError");
+    })();
+
+    try {
+      const first = await Promise.race([streamOutcome, snapshotOutcome]);
+      if ("source" in first && first.source === "stream-result") return first.result;
+      if ("source" in first && first.source === "stream-error") return await snapshotOutcome;
+      return first;
+    } finally {
+      internalController.abort();
+      outerController.signal.removeEventListener("abort", propagateAbort);
+    }
+  }
+
+  async function startArtifactDownload(
+    key: string,
+    path: string,
+    fallback: string,
+    label: string,
+  ) {
+    if (artifactBusyKey) return;
+    setArtifactBusyKey(key);
+    setArtifactState(null);
+    try {
+      const filename = await downloadArtifact(path, fallback);
+      setArtifactState({ key, path, fallback, label, message: `已开始下载 ${filename}`, error: false });
+    } catch (downloadError) {
+      setArtifactState({
+        key,
+        path,
+        fallback,
+        label,
+        message: downloadError instanceof Error ? downloadError.message : "下载失败，请重试。",
+        error: true,
+      });
+    } finally {
+      setArtifactBusyKey(null);
+    }
+  }
+
+  async function reopenFinding(findingId: string) {
+    if (!session || reopenBusyId) return;
+    const reviewId = session.review_id;
+    setReopenBusyId(findingId);
+    setError("");
+    try {
+      const result = await reopenReviewFinding(reviewId, findingId);
+      if (viewedReviewIdRef.current === reviewId) {
+        displaySession(result.session);
+        const reopened = result.session.findings.find((item) => item.finding_id === findingId);
+        if (reopened) {
+          setActiveFileId(reopened.file_id);
+          setSelectedFindingId(reopened.finding_id);
+        }
+        if (result.revision_retained) {
+          setError("问题已恢复为待处理；此前应用的代码修订仍然保留，可重新检查或生成新候选。 ");
+        }
+      }
+    } catch (reopenError) {
+      setError(reopenError instanceof Error ? reopenError.message : "重新打开问题失败，请重试。 ");
+    } finally {
+      setReopenBusyId(null);
+    }
+  }
+
+  async function attachToReview(
+    reviewId: string,
+    suppliedController?: AbortController,
+    initialStage = "正在连接审查进度",
+    recheckSnapshotFallback = false,
+  ): Promise<ReviewSession | null> {
+    const controller = suppliedController ?? new AbortController();
+    if (abortControllerRef.current && abortControllerRef.current !== controller) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = controller;
+    reviewIdRef.current = reviewId;
+    setRunningReviewId(reviewId);
+    setIsReviewing(true);
+    setStageMessage(initialStage);
+    setDisconnectedReviewId(null);
+    try {
+      const result = recheckSnapshotFallback
+        ? await watchRecheckReview(reviewId, controller)
+        : await watchReview(reviewId, controller);
+      if (controller.signal.aborted || stoppedControllersRef.current.has(controller)) return null;
+      if (viewedReviewIdRef.current === reviewId) displaySession(result);
+      return result;
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        reviewIdRef.current = null;
+        setRunningReviewId(null);
+        setIsReviewing(false);
+        setStageMessage("");
+        setProgress(null);
+      }
+    }
   }
 
   function displaySession(result: ReviewSession) {
@@ -638,15 +1050,38 @@ function App() {
 
   async function submitReview(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (isReviewDetail) {
+      setError("正在查看审查记录；请先点击“新建审查”再提交代码。");
+      return;
+    }
     const files = [];
+    const unsafeDraft = draftCode ? validateSourceText(draftCode) : null;
+    if (unsafeDraft) {
+      setError(unsafeDraft);
+      return;
+    }
     const trimmedCode = draftCode.trim();
+    const pastedBytes = new TextEncoder().encode(trimmedCode).length;
+    if (pastedBytes > MAX_SOURCE_FILE_BYTES) {
+      setError("粘贴的代码不能超过 2 MiB。");
+      return;
+    }
+    if (pastedBytes + attachments.reduce((total, item) => total + item.size, 0)
+        > MAX_REVIEW_SOURCE_BYTES) {
+      setError("一次审查的代码总量不能超过 8 MiB。");
+      return;
+    }
     if (trimmedCode) {
       const detected = detectLanguage(trimmedCode);
       if (!detected.language) {
         setError(detected.error ?? "无法识别代码语言。");
         return;
       }
-      files.push({ filename: detected.language === "python" ? "snippet.py" : "snippet.cpp", language: detected.language, content: trimmedCode });
+      files.push({
+        filename: uniqueSnippetFilename(detected.language, attachments.map((item) => item.filename)),
+        language: detected.language,
+        content: trimmedCode,
+      });
     }
     for (const attachment of attachments) {
       const detected = detectLanguage(attachment.content, attachment.filename);
@@ -721,9 +1156,9 @@ function App() {
         viewReview(created.review_id);
       }
       await openHistory();
-      const completed = await watchReview(created.review_id, controller);
+      const completed = await attachToReview(created.review_id, controller, "正在连接审查进度");
       if (controller.signal.aborted || stoppedControllersRef.current.has(controller)) return;
-      if (viewedReviewIdRef.current === created.review_id) displaySession(completed);
+      if (!completed) return;
       if (completed.status === "completed") {
         setDraftCode("");
         setAttachments([]);
@@ -732,6 +1167,14 @@ function App() {
       }
     } catch (reviewError) {
       if (reviewError instanceof DOMException && reviewError.name === "AbortError") return;
+      if (reviewError instanceof ApiError && reviewError.code === "stream_reconnect_exhausted" && createdReviewId) {
+        setDisconnectedReviewId(createdReviewId);
+      }
+      if (createdReviewId && viewedReviewIdRef.current === createdReviewId) {
+        viewReview(null);
+        setSession(null);
+        window.history.replaceState({}, "", "/");
+      }
       setError(reviewError instanceof Error ? reviewError.message : "审查请求失败，请稍后重试。");
     } finally {
       if (abortControllerRef.current === controller) {
@@ -749,21 +1192,40 @@ function App() {
     abortControllerRef.current = controller;
     reviewIdRef.current = session.review_id;
     setIsReviewing(true);
-    setStageMessage("正在恢复未完成的分块");
+    const pendingRevalidation = Object.values(session.finding_states ?? {})
+      .some((state) => state === "fixed_pending_revalidation");
+    const recheckAttemptPresent = Boolean(
+      session.recheck_attempt_id
+      || session.recheck_attempt_status
+      || session.recheck_deadline_at,
+    );
+    const recheckFailureMessage = [session.error, session.summary.text]
+      .filter((value): value is string => Boolean(value))
+      .some((value) => value.includes("统一复查"));
+    const isRecheckResume = pendingRevalidation || recheckAttemptPresent || recheckFailureMessage;
+    const resumeMessage = isRecheckResume
+      ? "修复已保留，正在重新复查修改后的代码"
+      : "正在恢复未完成的分块";
+    setStageMessage(resumeMessage);
     setProgress(null);
     setError("");
     try {
-      if (session.model.provider === "deepseek") {
-        await resumeReviewSession(session.review_id, deepSeekSettings.apiKey.trim());
-      } else {
-        await resumeReviewSession(session.review_id);
-      }
-      const completed = await watchReview(session.review_id, controller);
-      if (!controller.signal.aborted && !stoppedControllersRef.current.has(controller)) {
-        displaySession(completed);
-      }
+      const resumeRequest = Promise.resolve(
+        session.model.provider === "deepseek"
+          ? resumeReviewSession(session.review_id, deepSeekSettings.apiKey.trim())
+          : resumeReviewSession(session.review_id),
+      );
+      void resumeRequest.catch((resumeError: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(resumeError instanceof Error ? resumeError.message : "重新复查请求失败，请稍后重试。 ");
+        }
+      });
+      await attachToReview(session.review_id, controller, resumeMessage, isRecheckResume);
     } catch (reviewError) {
       if (reviewError instanceof DOMException && reviewError.name === "AbortError") return;
+      if (reviewError instanceof ApiError && reviewError.code === "stream_reconnect_exhausted") {
+        setDisconnectedReviewId(session.review_id);
+      }
       setError(reviewError instanceof Error ? reviewError.message : "恢复审查失败，请稍后重试。");
     } finally {
       if (abortControllerRef.current === controller) {
@@ -785,6 +1247,11 @@ function App() {
     reviewIdRef.current = null;
     setIsReviewing(false);
     setStageMessage("");
+    if (reviewId && viewedReviewIdRef.current === reviewId) {
+      viewReview(null);
+      setSession(null);
+      window.history.replaceState({}, "", "/");
+    }
     if (reviewId) {
       void cancelReviewSession(reviewId).catch((cancelError) => {
         setError(
@@ -853,10 +1320,6 @@ function App() {
   function resetWorkspace() {
     stopReview();
     viewReview(null);
-    setDraftCode("");
-    setAttachments([]);
-    setReviewOrigin(null);
-    setLocalDiffBaseFiles([]);
     setGitLabDialogOpen(false);
     setLocalDiffDialogOpen(false);
     setSession(null);
@@ -921,83 +1384,203 @@ function App() {
     });
   }
 
-  async function decideFinding(
-    finding: SessionFinding,
-    decision: "apply" | "keep",
-  ) {
+  async function decideFinding(finding: SessionFinding, decision: "accepted_risk" | "deferred" | "dismissed") {
     if (
       !session
       || !["completed", "failed"].includes(session.status)
       || isReviewing
     ) return;
     const sourceReviewId = session.review_id;
-    const previousSession = session;
     setFixBusyId(finding.finding_id);
     setError("");
-    if (decision === "keep" && viewedReviewIdRef.current === sourceReviewId) {
-      const remaining = session.findings.filter(
-        (item) => item.finding_id !== finding.finding_id,
-      );
-      setSession({ ...session, findings: remaining });
-      const nextFinding = remaining[0] ?? null;
-      setSelectedFindingId(nextFinding?.finding_id ?? null);
-      if (nextFinding) setActiveFileId(nextFinding.file_id);
-      setFollowupContext(null);
-    }
     try {
-      const result = session.model.provider === "deepseek"
-        ? await decideReviewFinding(sourceReviewId, finding.finding_id, decision, deepSeekSettings.apiKey.trim())
-        : await decideReviewFinding(sourceReviewId, finding.finding_id, decision);
+      const result = await decideReviewFinding(sourceReviewId, finding.finding_id, decision);
       if (viewedReviewIdRef.current === sourceReviewId) {
         setSession(result.session);
-        const nextFinding = result.session.findings[0] ?? null;
-        setSelectedFindingId(nextFinding?.finding_id ?? null);
-        if (nextFinding) setActiveFileId(nextFinding.file_id);
-        setFollowupContext(null);
       }
       await openHistory();
-      if (!result.revised_review) return;
+      if (result.revised_review) {
+        const revised = result.revised_review;
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+        reviewIdRef.current = revised.review_id;
+        setRunningReviewId(revised.review_id);
+        setIsReviewing(true);
+        viewReview(revised.review_id);
+        displaySession(revised);
+        setStageMessage("所有当前问题已决策，正在统一复查代码");
+        const completed = await watchReview(revised.review_id, controller);
+        if (!controller.signal.aborted && !stoppedControllersRef.current.has(controller)) {
+          displaySession(completed);
+          await openHistory();
+        }
+      }
+    } catch (decisionError) {
+      if (!(decisionError instanceof DOMException && decisionError.name === "AbortError")) {
+        setError(decisionError instanceof Error ? decisionError.message : "处理修复建议失败。");
+      }
+    } finally {
+      setFixBusyId(null);
+      abortControllerRef.current = null;
+      reviewIdRef.current = null;
+      setRunningReviewId(null);
+      setIsReviewing(false);
+      setProgress(null);
+    }
+  }
 
-      const keepFocus = viewedReviewIdRef.current === sourceReviewId;
+  async function generateFixPreview(finding: SessionFinding) {
+    if (!session || !["completed", "failed"].includes(session.status) || isReviewing || repairIntent) return;
+    setFixBusyId(finding.finding_id);
+    setStageMessage("正在生成候选修复并执行静态验证");
+    setError("");
+    const controller = new AbortController();
+    fixPreviewControllerRef.current = controller;
+    try {
+      const candidate = session.model.provider === "deepseek"
+        ? await previewReviewFix(session.review_id, finding.finding_id, deepSeekSettings.apiKey.trim(), controller.signal)
+        : await previewReviewFix(session.review_id, finding.finding_id, undefined, controller.signal);
+      setFixCandidate(candidate);
+      setStageMessage("候选修复已验证，等待确认");
+    } catch (previewError) {
+      if (previewError instanceof DOMException && previewError.name === "AbortError") {
+        setError("已停止等待候选生成；服务端任务可能继续到结束，但结果不会写入审查会话。可稍后重新生成。");
+      } else if (
+        previewError instanceof ApiError
+        && ["needs_intent", "ambiguous_symbol"].includes(previewError.code ?? "")
+      ) {
+        const evidence = (
+          previewError.details?.use_def_evidence ?? finding.use_def_evidence
+        ) as UseDefEvidence | undefined;
+        const source = session.files.find((item) => item.file_id === finding.file_id);
+        const baseSha = typeof previewError.details?.base_sha === "string"
+          ? previewError.details.base_sha
+          : source?.sha256;
+        if (evidence && baseSha) {
+          setRepairIntent({ finding, evidence, baseSha });
+          setError("");
+        } else {
+          setError(previewError.message);
+        }
+      } else {
+        setError(repairFailureMessage(previewError, "生成候选修复失败，会话未改变。"));
+      }
+      setStageMessage("");
+    } finally {
+      if (fixPreviewControllerRef.current === controller) fixPreviewControllerRef.current = null;
+      setFixBusyId(null);
+    }
+  }
+
+  async function generateIntentFix(option: RepairIntentOption, value?: string) {
+    if (!session || !repairIntent) return;
+    if (option.kind === "defer") {
+      const finding = repairIntent.finding;
+      setRepairIntent(null);
+      await decideFinding(finding, "deferred");
+      return;
+    }
+    const controller = new AbortController();
+    setFixBusyId(repairIntent.finding.finding_id);
+    setError("");
+    try {
+      const candidate = await previewReviewFixWithIntent(
+        session.review_id,
+        repairIntent.finding.finding_id,
+        {
+          review_id: session.review_id,
+          finding_id: repairIntent.finding.finding_id,
+          base_sha: repairIntent.baseSha,
+          option_id: option.option_id,
+          intent_kind: option.kind,
+          selected_symbol: option.kind === "import_symbol"
+            ? repairIntent.evidence.unresolved_name
+            : option.symbol ?? (option.kind === "declare_parameter" ? repairIntent.evidence.unresolved_name : null),
+          import_source: option.module ?? null,
+          initializer: option.kind === "declare_local" ? value ?? null : null,
+          user_intent: option.kind === "custom_behavior" ? value ?? null : null,
+        },
+        controller.signal,
+      );
+      setRepairIntent(null);
+      setFixCandidate(candidate);
+      setStageMessage("候选修复已验证，等待确认");
+    } catch (intentError) {
+      setError(repairFailureMessage(intentError, "无法按所选意图生成候选。"));
+    } finally {
+      setFixBusyId(null);
+    }
+  }
+
+  function stopFixPreviewGeneration() {
+    fixPreviewControllerRef.current?.abort();
+  }
+
+  async function cancelFixPreview() {
+    if (!fixCandidate || fixConfirmationBusy) return;
+    setFixConfirmationBusy(true);
+    try {
+      await cancelReviewFix(fixCandidate.review_id, fixCandidate.candidate_id);
+      setFixCandidate(null);
+      setStageMessage("");
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : "取消候选修复失败。");
+    } finally {
+      setFixConfirmationBusy(false);
+    }
+  }
+
+  async function applyFixCandidate() {
+    if (!fixCandidate || fixConfirmationBusy) return;
+    const sourceReviewId = fixCandidate.review_id;
+    let fixWasApplied = false;
+    setFixConfirmationBusy(true);
+    setStageMessage("正在确认写入修复并准备统一复查");
+    setError("");
+    try {
+      const result = await confirmReviewFix(sourceReviewId, fixCandidate.candidate_id);
+      fixWasApplied = true;
+      if (viewedReviewIdRef.current === sourceReviewId) displaySession(result.session);
+      await openHistory();
+      if (!result.revised_review) {
+        setFixCandidate(null);
+        setStageMessage("修复已应用；可继续处理其它问题");
+        return;
+      }
       const revised = result.revised_review;
       const controller = new AbortController();
       abortControllerRef.current = controller;
       reviewIdRef.current = revised.review_id;
       setRunningReviewId(revised.review_id);
       setIsReviewing(true);
-      if (keepFocus) {
-        viewReview(revised.review_id);
-        displaySession(revised);
-        setFollowupContext(null);
-      }
-      setStageMessage("当前问题已全部处理，正在统一复查代码");
-      setProgress(null);
+      viewReview(revised.review_id);
+      displaySession(revised);
+      setStageMessage("所有当前问题已决策，正在统一复查代码");
       const completed = await watchReview(revised.review_id, controller);
-      if (!controller.signal.aborted && !stoppedControllersRef.current.has(controller)) {
-        if (viewedReviewIdRef.current === revised.review_id) displaySession(completed);
-        await openHistory();
+      if (controller.signal.aborted || stoppedControllersRef.current.has(controller)) {
+        throw new Error("统一复查已中止，请从审查记录查看当前修订状态。");
       }
-    } catch (decisionError) {
-      if (!(decisionError instanceof DOMException && decisionError.name === "AbortError")) {
-        if (
-          decision === "keep"
-          && viewedReviewIdRef.current === sourceReviewId
-        ) {
-          displaySession(previousSession);
-        }
-        setError(decisionError instanceof Error ? decisionError.message : "处理修复建议失败。");
+      displaySession(completed);
+      if (completed.status !== "completed") {
+        throw new Error(completed.error || "统一复查未能完整完成。");
       }
+      setFixCandidate(null);
+      await openHistory();
+    } catch (confirmError) {
+      if (fixWasApplied) setFixCandidate(null);
+      const detail = confirmError instanceof Error ? confirmError.message : "统一复查未能完成。";
+      setError(
+        fixWasApplied
+          ? `修复已应用，但统一复查失败：${detail}`
+          : detail || "应用候选修复失败，会话未改变。",
+      );
     } finally {
-      setFixBusyId(null);
-      const controller = abortControllerRef.current;
-      if (controller && reviewIdRef.current) {
-        abortControllerRef.current = null;
-        reviewIdRef.current = null;
-        setRunningReviewId(null);
-        setIsReviewing(false);
-        setStageMessage("");
-        setProgress(null);
-      }
+      setFixConfirmationBusy(false);
+      abortControllerRef.current = null;
+      reviewIdRef.current = null;
+      setRunningReviewId(null);
+      setIsReviewing(false);
+      setProgress(null);
     }
   }
 
@@ -1078,6 +1661,10 @@ function App() {
           onOpen={openHistorySession}
           onRename={renameHistorySession}
           onDelete={deleteHistorySession}
+          hasMore={historyHasMore}
+          loadingMore={historyLoading}
+          loadError={historyError}
+          onLoadMore={() => openHistory(historyError ? historyRetryReset : false)}
         />
         {authSession ? <SidebarAccountMenu user={authSession.user} onOpenSettings={authSession.openAccountSettings} onOpenAdmin={authSession.openAdminManagement} onSignOut={authSession.signOut} /> : null}
       </aside>
@@ -1093,30 +1680,88 @@ function App() {
             <div className="model-health-summary" aria-label="模型健康状态">
               <span className={`status-dot status-${healthSummary}`} />
               <span>{healthSummary}</span>
+              {localHealthDetail ? <span className="model-health-detail" role="status">{localHealthDetail}</span> : null}
             </div>
             {session?.revisions?.length ? (
+              <>
+                <button type="button" className="icon-text-button" disabled={isReviewing} onClick={() => void openRevisionHistory()}><HistoryIcon size={16} />修改历史</button>
+                <button
+                  type="button"
+                  className="icon-text-button"
+                  disabled={artifactBusyKey !== null}
+                  onClick={() => void startArtifactDownload(
+                    "patch",
+                    `/v1/reviews/${session.review_id}/fixes.patch`,
+                    `${session.review_id}.patch`,
+                    "下载 .patch",
+                  )}
+                ><FileDiff size={16} />{artifactBusyKey === "patch" ? "下载中…" : artifactState?.key === "patch" && artifactState.error ? "重试下载 .patch" : "下载 .patch"}</button>
+                <button
+                  type="button"
+                  className="icon-text-button"
+                  disabled={artifactBusyKey !== null}
+                  onClick={() => void startArtifactDownload(
+                    "all-fixed",
+                    `/v1/reviews/${session.review_id}/fixed-files.zip`,
+                    `${session.review_id}-fixed-files.zip`,
+                    "全部修复文件",
+                  )}
+                ><FileCode2 size={16} />{artifactBusyKey === "all-fixed" ? "下载中…" : artifactState?.key === "all-fixed" && artifactState.error ? "重试全部文件" : "全部修复文件"}</button>
+                {activeFile && session.revisions.some(item => !item.undone_at && item.file_id === activeFile.file_id) ? (
+                  <button
+                    type="button"
+                    className="icon-text-button"
+                    disabled={artifactBusyKey !== null}
+                    title={activeFile.relative_path}
+                    onClick={() => void startArtifactDownload(
+                      `file:${activeFile.file_id}`,
+                      `/v1/reviews/${session.review_id}/fixed-files/${activeFile.file_id}`,
+                      activeFile.relative_path.split("/").pop() || "fixed-file.txt",
+                      "当前修复文件",
+                    )}
+                  ><FileCode2 size={16} />{artifactBusyKey === `file:${activeFile.file_id}` ? "下载中…" : artifactState?.key === `file:${activeFile.file_id}` && artifactState.error ? "重试当前文件" : "当前修复文件"}</button>
+                ) : null}
+              </>
+            ) : null}
+            {session?.status === "completed" ? (
               <button
                 type="button"
                 className="icon-text-button"
-                disabled={isReviewing}
-                onClick={() => void openRevisionHistory()}
+                disabled={artifactBusyKey !== null}
+                onClick={() => void startArtifactDownload(
+                  "report",
+                  `/v1/reviews/${session.review_id}/report`,
+                  `${session.review_id}-report.md`,
+                  "导出报告",
+                )}
               >
-                <HistoryIcon size={16} />修改历史
+                <ArrowRight size={16} />{artifactBusyKey === "report" ? "下载中…" : artifactState?.key === "report" && artifactState.error ? "重试导出报告" : "导出报告"}
               </button>
-            ) : null}
-            {session?.status === "completed" ? (
-              <a
-                className="icon-text-button"
-                href={`/v1/reviews/${session.review_id}/report`}
-                download
-              >
-                <ArrowRight size={16} />导出报告
-              </a>
             ) : (
               <button type="button" className="icon-text-button" disabled><ArrowRight size={16} />导出报告</button>
             )}
           </div>
         </header>
+        {artifactState ? (
+          <div
+            className={artifactState.error ? "artifact-download-status error" : "artifact-download-status"}
+            role={artifactState.error ? "alert" : "status"}
+          >
+            <span>{artifactState.message}</span>
+            {artifactState.error ? (
+              <button
+                type="button"
+                disabled={artifactBusyKey !== null}
+                onClick={() => void startArtifactDownload(
+                  artifactState.key,
+                  artifactState.path,
+                  artifactState.fallback,
+                  artifactState.label,
+                )}
+              >重试</button>
+            ) : null}
+          </div>
+        ) : null}
 
         {session ? (
           <div className="result-toolbar">
@@ -1124,14 +1769,29 @@ function App() {
             {session.status === "failed" ? (
               <div className="result-actions">
                 <button type="button" className="icon-text-button resume-button" onClick={resumeFailedReview}>
-                  继续未完成审查
+                  {failedReviewUsesRecheck ? "重新复查" : "继续未完成审查"}
                 </button>
               </div>
             ) : null}
           </div>
         ) : null}
 
-        {error ? <div className="message message-error" role="alert"><AlertTriangle size={17} />{error}</div> : null}
+        {error ? (
+          <div className="message message-error" role="alert">
+            <AlertTriangle size={17} />
+            <span>{error}</span>
+            {disconnectedReviewId ? (
+              <button
+                type="button"
+                className="inline-retry-button"
+                disabled={isReviewing}
+                onClick={() => void openHistorySession(disconnectedReviewId, undefined, false)}
+              >
+                重新连接
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         <section className="result-section" aria-label="审查结果">
           {isReviewing && (!viewedReviewId || viewedReviewId === runningReviewId) ? (
@@ -1194,7 +1854,7 @@ function App() {
         </section>
 
         <form className="chat-composer" onSubmit={submitReview}>
-          {attachments.length ? (
+          {!isReviewDetail && attachments.length ? (
             <div className="attachment-list" aria-label="已添加文件">
               {attachments.map((attachment) => {
                 const detected = detectLanguage(attachment.content, attachment.filename);
@@ -1230,11 +1890,25 @@ function App() {
             </div>
           ) : null}
           <label className="sr-only" htmlFor="review-composer">输入需要审查的代码</label>
-          <textarea id="review-composer" aria-label="输入需要审查的代码" value={draftCode} onChange={(event) => setDraftCode(event.target.value)} placeholder="粘贴 Python 或 C++ 代码，也可以添加一个或多个文件" spellCheck={false} disabled={isReviewing} />
+          <textarea
+            id="review-composer"
+            aria-label="输入需要审查的代码"
+            value={isReviewDetail ? "" : draftCode}
+            onChange={(event) => setDraftCode(event.target.value)}
+            placeholder={isReviewDetail ? "正在查看审查记录；点击“新建审查”后可继续未提交草稿" : "粘贴 Python 或 C++ 代码，也可以添加一个或多个文件"}
+            spellCheck={false}
+            disabled={isReviewing || isReviewDetail}
+            aria-invalid={Boolean(draftTextError)}
+          />
+          {isReviewDetail ? (
+            <p className="composer-inline-status" role="status">正在查看审查记录；点击“新建审查”后可继续未提交草稿。</p>
+          ) : draftTextError ? (
+            <p className="composer-inline-status error" role="alert">{draftTextError}</p>
+          ) : null}
           <div className="composer-toolbar">
-            <input ref={fileInputRef} className="hidden-file-input" type="file" multiple accept=".py,.pyw,.cc,.cpp,.cxx,.hh,.hpp,.hxx" aria-label="添加代码文件" onChange={handleFiles} disabled={isReviewing} />
+            <input ref={fileInputRef} className="hidden-file-input" type="file" multiple accept=".py,.pyw,.cc,.cpp,.cxx,.hh,.hpp,.hxx" aria-label="添加代码文件" onChange={handleFiles} disabled={isReviewing || isReviewDetail} />
             <AttachmentMenu
-              disabled={isReviewing}
+              disabled={isReviewing || isReviewDetail}
               onSelectLocalFiles={() => fileInputRef.current?.click()}
               onSelectLocalDiff={() => setLocalDiffDialogOpen(true)}
               onSelectGitLab={() => setGitLabDialogOpen(true)}
@@ -1244,7 +1918,7 @@ function App() {
                 <Square size={13} fill="currentColor" /><span>停止生成</span>
               </button>
             ) : (
-              <button type="submit" className="composer-send" aria-label="发送审查" disabled={!draftCode.trim() && attachments.length === 0}>
+              <button type="submit" className="composer-send" aria-label="发送审查" disabled={isReviewDetail || Boolean(draftTextError) || (!draftCode.trim() && attachments.length === 0)}>
                 <Send size={17} aria-hidden="true" /><span>发送审查</span>
               </button>
             )}
@@ -1254,7 +1928,8 @@ function App() {
 
       <aside className="sidebar sidebar-right" aria-label="问题导航">
         <div className="right-heading"><p className="eyebrow">Finding map</p><h2>问题导航</h2></div>
-        <ol className="finding-nav">
+        <div className="finding-scroll-surface">
+          <ol className="finding-nav">
           {session?.findings.map((finding) => {
             const expanded = selectedFindingId === finding.finding_id;
             const panelId = `finding-accordion-panel-${finding.finding_id}`;
@@ -1266,12 +1941,13 @@ function App() {
                 <button
                   className={expanded ? "finding-nav-link active" : "finding-nav-link"}
                   type="button"
+                  aria-label={`${severityLabels[finding.severity]}：${finding.title}`}
                   aria-expanded={expanded}
                   aria-controls={panelId}
                   onClick={() => navigateToFinding(finding)}
                 >
                   <span className={`severity-dot severity-dot-${finding.severity}`} />
-                  <span>{finding.title}</span>
+                  <span title={finding.title}>{finding.title}</span>
                 </button>
                 {expanded ? (
                   <section
@@ -1291,38 +1967,44 @@ function App() {
                     <div className="finding-decision-card">
                       <div className="finding-decision-copy">
                         <strong>处理这条建议</strong>
-                        <p>应用会立即修改对应代码并移除问题；全部处理完成后统一复查。</p>
+                         <p>修复先生成候选 Diff，确认后才写入；接受风险会保留在报告中。</p>
                       </div>
                       {session?.finding_decisions?.[finding.finding_id] ? (
                         <span className={`decision-state decision-state-${session.finding_decisions[finding.finding_id]}`}>
-                          {session.finding_decisions[finding.finding_id] === "apply"
-                            ? "已应用并复查"
-                            : "已选择暂不修改"}
+                           {session.finding_decisions[finding.finding_id] === "fixed"
+                             ? "已修复"
+                             : session.finding_decisions[finding.finding_id] === "accepted_risk"
+                               ? "已接受风险"
+                               : session.finding_decisions[finding.finding_id] === "deferred"
+                                 ? "稍后处理"
+                                 : "判定不成立"}
                         </span>
                       ) : null}
                       <div className="finding-decision-actions">
                         <button
                           type="button"
-                          className="decision-action decision-action-primary"
-                          aria-label="按建议修改"
-                          title="立即修改代码并移除该问题"
-                          disabled={fixBusyId === finding.finding_id || isReviewing}
-                          onClick={() => void decideFinding(finding, "apply")}
+                          className="decision-action finding-decision-action decision-action-primary"
+                          aria-label={fixBusyId === finding.finding_id ? "停止等待生成" : "应用修复"}
+                          title={fixBusyId === finding.finding_id ? "停止等待候选生成" : "先生成、验证并预览候选修复"}
+                          disabled={isReviewing}
+                          onClick={() => fixBusyId === finding.finding_id
+                            ? stopFixPreviewGeneration()
+                            : void generateFixPreview(finding)}
                         >
                           <Check size={17} aria-hidden="true" />
-                          <span>{fixBusyId === finding.finding_id ? "正在生成修复…" : "应用修复"}</span>
+                          <span>应用修复</span>
                         </button>
                         <button
                           type="button"
-                          className="decision-action decision-action-secondary"
-                          aria-label="暂不修改"
-                          title="保留当前代码并从问题列表移除"
+                          className="decision-action finding-decision-action decision-action-secondary"
+                           aria-label="接受风险"
+                           title="明确记录接受风险，问题仍在报告中可见"
                           disabled={fixBusyId === finding.finding_id || isReviewing}
-                          onClick={() => void decideFinding(finding, "keep")}
+                           onClick={() => void decideFinding(finding, "accepted_risk")}
                         >
-                          <X size={17} aria-hidden="true" />
-                          <span>暂不修改</span>
-                        </button>
+                           <ShieldCheck size={17} aria-hidden="true" />
+                           <span>接受风险</span>
+                         </button>
                       </div>
                     </div>
                   </section>
@@ -1330,9 +2012,58 @@ function App() {
               </li>
             );
           })}
-        </ol>
-        {!session?.findings.length ? <p className="muted">提交代码后显示问题索引。</p> : null}
+          </ol>
+          {!session?.findings.length ? <p className="muted">当前没有活动问题。</p> : null}
+          {processedFindings.length ? (
+            <details className="processed-findings">
+              <summary>已处理问题（{processedFindings.length}）</summary>
+              <div className="processed-finding-list">
+                {processedFindings.map(({ finding, decision, audit }) => {
+                  const revisionRetained = session?.revisions?.some(
+                    (item) => item.finding_id === finding.finding_id && !item.undone_at,
+                  ) ?? false;
+                  return (
+                    <article className="processed-finding" key={finding.finding_id}>
+                      <div>
+                        <span className={`severity severity-${finding.severity}`}>{severityLabels[finding.severity]}</span>
+                        <strong title={finding.title}>{finding.title}</strong>
+                      </div>
+                      <p>{decisionLabels[decision]}</p>
+                      <p title={audit?.reason ?? "历史记录未提供原因"}>{audit?.reason ?? "历史记录未提供原因"}</p>
+                      <time dateTime={audit?.created_at}>{audit?.created_at ? new Date(audit.created_at).toLocaleString("zh-CN") : "历史时间未知"}</time>
+                      {revisionRetained ? <small>重新检查不会撤销已经应用的代码修订。</small> : null}
+                      <button
+                        type="button"
+                        className="processed-reopen-button"
+                        disabled={reopenBusyId !== null || isReviewing}
+                        onClick={() => void reopenFinding(finding.finding_id)}
+                      >{reopenBusyId === finding.finding_id ? "处理中…" : revisionRetained ? "重新检查" : "重新打开"}</button>
+                    </article>
+                  );
+                })}
+              </div>
+            </details>
+          ) : null}
+        </div>
       </aside>
+      <FixPreviewDialog
+        candidate={fixCandidate}
+        busy={fixConfirmationBusy}
+        onCancel={() => void cancelFixPreview()}
+        onConfirm={() => void applyFixCandidate()}
+      />
+      {repairIntent ? (
+        <RepairIntentDialog
+          evidence={repairIntent.evidence}
+          busy={fixBusyId === repairIntent.finding.finding_id}
+          error={error}
+          onCancel={() => {
+            setRepairIntent(null);
+            setError("");
+          }}
+          onSubmit={(option, value) => void generateIntentFix(option, value)}
+        />
+      ) : null}
       <RevisionHistoryDialog
         open={revisionDialogOpen}
         items={revisions}
@@ -1356,6 +2087,11 @@ function App() {
           setGitLabDialogOpen(false);
           setResumeGitLabImportAfterAccount(true);
           authSession?.openAccountSettings();
+        }}
+        oauthToken={gitLabOAuthToken}
+        oauthError={gitLabOAuthError}
+        onOAuthConnect={() => {
+          void beginGitLabOAuth(defaultGitLabRedirectUri()).catch((oauthError) => setGitLabOAuthError(oauthError instanceof Error ? oauthError.message : "GitLab OAuth 尚未配置。"));
         }}
         onImport={importGitLabFiles}
       />

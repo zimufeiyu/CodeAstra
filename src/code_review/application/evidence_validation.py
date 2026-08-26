@@ -3,18 +3,16 @@ from __future__ import annotations
 import re
 import uuid
 
+from code_review.application.finding_verifier import FindingVerifier
 from code_review.domain.model_protocol import ReviewFinding
 from code_review.domain.review_chunks import ReviewChunk
-from code_review.domain.review_models import Finding, FindingVerification, SourceFile
-
-_DETERMINISTIC_MARKERS = (
-    "unused",
-    "未使用",
-    "undefined",
-    "未定义",
-    "syntax",
-    "语法",
+from code_review.domain.review_models import (
+    Finding,
+    FindingVerification,
+    RootCauseEvidence,
+    SourceFile,
 )
+
 _GENERIC_TITLES = {
     "存在风险",
     "代码存在问题",
@@ -38,11 +36,14 @@ _HIGH_RISK_MARKERS = (
 
 
 class EvidenceValidator:
+    def __init__(self, finding_verifier: FindingVerifier | None = None) -> None:
+        self._finding_verifier = finding_verifier or FindingVerifier()
+
     def validate(
         self,
         draft: ReviewFinding,
         files: list[SourceFile],
-        static_findings: list[Finding],
+        _static_findings: list[Finding],
         *,
         target_chunk: ReviewChunk | None = None,
         analyzer_name: str = "qwen3-8b",
@@ -78,15 +79,16 @@ class EvidenceValidator:
             normalized_claim,
         ):
             return None
-        if any(
-            marker in normalized_claim for marker in _DETERMINISTIC_MARKERS
-        ) and not self._has_static_confirmation(draft, source, static_findings):
+        if self._is_deterministic_claim(draft, normalized_claim):
             return None
 
         location = self._locate_evidence(source, draft)
         if location is None:
             return None
         start_line, start_column, end_line, end_column = location
+        verified = self._finding_verifier.verify_draft(draft, source, files)
+        if verified.action == "suppress":
+            return None
 
         severity = draft.severity
         if severity in {"critical", "high"} and not any(
@@ -104,6 +106,7 @@ class EvidenceValidator:
             severity=severity,
             confidence=draft.confidence,
             file_id=source.file_id,
+            relative_path=source.relative_path,
             start_line=start_line,
             start_column=start_column,
             end_line=end_line,
@@ -119,20 +122,38 @@ class EvidenceValidator:
                 evidence_matched=True,
                 static_confirmed=False,
             ),
+            symbol=verified.symbol,
+            verifier="finding-verifier",
+            verification_reason=verified.message,
+            rename_plan=verified.rename_plan,
+            fix_safety=(
+                verified.rename_plan.safety
+                if verified.rename_plan is not None
+                else "requires_review"
+            ),
+            root_cause_claim=(
+                RootCauseEvidence.model_validate(draft.root_cause_claim.model_dump())
+                if draft.root_cause_claim is not None
+                else None
+            ),
         )
 
     @staticmethod
-    def _has_static_confirmation(
-        draft: ReviewFinding,
-        source: SourceFile,
-        static_findings: list[Finding],
-    ) -> bool:
-        return any(
-            finding.file_id == source.file_id
-            and finding.start_line <= draft.end_line
-            and finding.end_line >= draft.start_line
-            for finding in static_findings
+    def _is_deterministic_claim(draft: ReviewFinding, normalized_claim: str) -> bool:
+        rule_id = draft.rule_id.casefold()
+        if rule_id.startswith(("python.", "ruff.", "pyflakes.", "compiler.")):
+            return True
+        exact_fact_markers = (
+            "名称未定义",
+            "undefined name",
+            "语法错误",
+            "syntax error",
+            "未使用的导入",
+            "unused import",
+            "编译错误",
+            "compiler error",
         )
+        return any(marker in normalized_claim for marker in exact_fact_markers)
 
     @staticmethod
     def _locate_evidence(
@@ -204,11 +225,10 @@ def _same_problem(left: Finding, right: Finding) -> bool:
     ranges_overlap = left.start_line <= right.end_line and right.start_line <= left.end_line
     if not ranges_overlap:
         return False
-    left_text = f"{left.rule_id} {left.category} {left.title} {left.evidence}".lower()
-    right_text = f"{right.rule_id} {right.category} {right.title} {right.evidence}".lower()
-    same_evidence = left.evidence.strip() == right.evidence.strip()
-    same_category = left.category == right.category
-    security_match = any(
-        marker in left_text and marker in right_text for marker in _HIGH_RISK_MARKERS
+    same_evidence = " ".join(left.evidence.casefold().split()) == " ".join(
+        right.evidence.casefold().split()
     )
-    return same_evidence or (same_category and security_match)
+    same_rule_symbol = left.rule_id == right.rule_id and left.symbol == right.symbol
+    # Never merge separate security claims merely because they share a category
+    # and overlap a line. Normalized rule, symbol and evidence form the issue identity.
+    return same_rule_symbol and same_evidence

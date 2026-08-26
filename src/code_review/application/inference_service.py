@@ -52,6 +52,35 @@ class ReviewOutputError(RuntimeError):
     """The model did not produce a complete, valid review response."""
 
 
+FixFailureCode = Literal[
+    "finding_not_actionable",
+    "already_compliant",
+    "no_effective_diff",
+    "model_output_invalid",
+    "scope_mismatch",
+    "syntax_invalid",
+    "stale_revision",
+    "needs_intent",
+    "speculative_finding",
+    "ambiguous_symbol",
+    "replacement_indent_invalid",
+    "root_cause_unverified",
+]
+
+
+class FixCandidateError(ReviewOutputError):
+    def __init__(
+        self,
+        code: FixFailureCode,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
 @dataclass(frozen=True)
 class ReviewStreamEvent:
     event: Literal["status", "delta", "reset", "final"]
@@ -66,6 +95,10 @@ class InferenceService:
     ) -> None:
         self._client = client
         self._registry = registry
+
+    @property
+    def registry(self) -> InstanceRegistryPort:
+        return self._registry
 
     async def answer_followup(self, request: InferenceRequest) -> str:
         lease = await self._registry.acquire(

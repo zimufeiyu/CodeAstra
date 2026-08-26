@@ -1,6 +1,7 @@
 import { RotateCcw, X } from "lucide-react";
 
 import type { ReviewRevision } from "../api/client";
+import { UnifiedDiff } from "./UnifiedDiff";
 
 type RevisionHistoryDialogProps = {
   open: boolean;
@@ -48,7 +49,7 @@ export function RevisionHistoryDialog({
                 {item.undone_at ? <span className="revision-status">已撤销</span> : null}
               </div>
               {item.explanation ? <p>{item.explanation}</p> : null}
-              <pre aria-label={`${item.relative_path} 修改差异`}>{item.diff || "未生成文本差异"}</pre>
+              <UnifiedDiff diff={item.diff || "未生成文本差异"} label={`${item.relative_path} 修改差异`} />
               {!item.undone_at ? (
                 <button
                   type="button"

@@ -3,9 +3,47 @@ export type AuthSessionInfo = { session_id: string; current: boolean; created_at
 export type AuthSessionPage = { total: number; items: AuthSessionInfo[] };export type AdminUser = AuthUser;
 export type UserPage = { items: AdminUser[]; total: number; page: number; page_size: number };
 export type UserStats = { total: number; active: number; disabled: number };
+class AuthApiError extends Error {
+  status: number;
+  detail: string;
+  code?: string;
+
+  constructor(status: number, detail: string, code?: string) {
+    super(detail);
+    this.name = "AuthApiError";
+    this.status = status;
+    this.detail = detail;
+    this.code = code;
+  }
+}
 async function json<T>(request: Promise<Response>): Promise<T> {
   const response = await request; const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw { status: response.status, detail: body.detail || "请求失败" };
+  if (!response.ok) {
+    const fallback: Record<number, string> = {
+      401: "账号已在其他设备登录或会话已过期，请重新登录。",
+      403: "当前账号没有权限，或页面安全令牌已过期。",
+      409: "当前内容已发生变化，请刷新后重试。",
+      413: "请求内容过大，请缩小后重试。",
+      422: "输入内容无法处理，请根据提示修改。",
+      429: "请求过于频繁，请稍后重试。",
+      502: "模型服务暂时失败，请稍后重试。",
+    };
+    const rawDetail = body.detail;
+    const detail = typeof rawDetail === "object" && rawDetail
+      ? rawDetail.message
+      : typeof rawDetail === "string"
+        ? rawDetail
+        : fallback[response.status] || "请求失败";
+    const translated: Record<string, string> = {
+      "authentication required": fallback[401],
+      "invalid CSRF token": "页面安全令牌已过期，请刷新后重试。",
+    };
+    throw new AuthApiError(
+      response.status,
+      translated[detail] ?? detail,
+      typeof rawDetail === "object" && rawDetail ? rawDetail.error_code : undefined,
+    );
+  }
   return body as T;
 }
 const headers = (csrf: string, content = false) => ({ ...(content ? { "Content-Type": "application/json" } : {}), "X-CSRF-Token": csrf });
@@ -27,6 +65,9 @@ export const adminApi = {
 };
 let originalFetch: typeof window.fetch | null = null;
 let authenticatedCsrfToken = "";
+let authExpiredNotified = false;
+
+export const AUTH_EXPIRED_EVENT = "codeastra:auth-expired";
 
 export function getAuthenticatedCsrfToken(): string {
   return authenticatedCsrfToken;
@@ -34,13 +75,24 @@ export function getAuthenticatedCsrfToken(): string {
 
 export function installAuthenticatedFetch(csrf: string): void {
   authenticatedCsrfToken = csrf;
+  authExpiredNotified = false;
   if (!originalFetch) originalFetch = window.fetch.bind(window);
-  window.fetch = (input, init = {}) => {
+  window.fetch = async (input, init = {}) => {
     const method = (init.method || "GET").toUpperCase();
-    if (["GET", "HEAD", "OPTIONS"].includes(method)) return originalFetch!(input, init);
-    const requestHeaders = new Headers(init.headers); if (!requestHeaders.has("X-CSRF-Token")) requestHeaders.set("X-CSRF-Token", csrf);
-    return originalFetch!(input, { ...init, headers: requestHeaders, credentials: init.credentials || "same-origin" });
+    let requestInit = init;
+    if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+      const requestHeaders = new Headers(init.headers);
+      if (!requestHeaders.has("X-CSRF-Token")) requestHeaders.set("X-CSRF-Token", csrf);
+      requestInit = { ...init, headers: requestHeaders, credentials: init.credentials || "same-origin" };
+    }
+    const response = await originalFetch!(input, requestInit);
+    const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const path = new URL(rawUrl, window.location.href).pathname;
+    const protectedApi = path.startsWith("/v1/") && path !== "/v1/auth/login";
+    if (response.status === 401 && protectedApi && !authExpiredNotified) {
+      authExpiredNotified = true;
+      window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
+    }
+    return response;
   };
 }
-
-

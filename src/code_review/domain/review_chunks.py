@@ -27,6 +27,9 @@ class ChunkErrorCode(StrEnum):
     INVALID_OUTPUT = "invalid_output"
     VALIDATION_ERROR = "validation_error"
     CANCELLED = "cancelled"
+    LOCAL_MODEL_CONNECTION_REFUSED = "local_model_connection_refused"
+    LOCAL_MODEL_TIMEOUT = "local_model_timeout"
+    LOCAL_MODEL_CIRCUIT_OPEN = "local_model_circuit_open"
 
 
 class ContextReference(BaseModel):

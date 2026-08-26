@@ -19,6 +19,7 @@ test("only allows undoing the latest active revision", async () => {
           file_id: "file-1",
           relative_path: "snippet.py",
           created_at: "2026-08-09T10:00:00Z",
+          before_sha256: "c".repeat(64),
           after_sha256: "b".repeat(64),
           diff: "-old\n+new",
           undone_at: null,
@@ -29,6 +30,7 @@ test("only allows undoing the latest active revision", async () => {
           file_id: "file-1",
           relative_path: "snippet.py",
           created_at: "2026-08-09T09:00:00Z",
+          before_sha256: "d".repeat(64),
           after_sha256: "a".repeat(64),
           diff: "-before\n+after",
           undone_at: null,
@@ -42,4 +44,10 @@ test("only allows undoing the latest active revision", async () => {
   expect(buttons[1]).toBeDisabled();
   await userEvent.click(buttons[0]);
   expect(onUndo).toHaveBeenCalledWith("new");
+  const diffs = screen.getAllByLabelText("snippet.py 修改差异");
+  const diffLines = diffs[0].querySelectorAll(".fix-diff-line");
+  expect(diffLines[0]).toHaveTextContent("-old");
+  expect(diffLines[1]).toHaveTextContent("+new");
+  expect(diffLines[0]).toHaveClass("removed");
+  expect(diffLines[1]).toHaveClass("added");
 });

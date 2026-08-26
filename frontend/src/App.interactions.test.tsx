@@ -119,8 +119,9 @@ describe("history, report and follow-up interactions", () => {
         created_at: "2026-08-04T01:00:00+00:00",
       },
     ]);
-    vi.mocked(askReviewFollowup).mockResolvedValue([
-      {
+    vi.mocked(askReviewFollowup).mockResolvedValue({
+      action: "answer",
+      messages: [{
         message_id: "question-new",
         review_id: "review-1",
         role: "user",
@@ -133,8 +134,8 @@ describe("history, report and follow-up interactions", () => {
         role: "assistant",
         content: "使用安全解析器。",
         created_at: "2026-08-04T01:01:01+00:00",
-      },
-    ]);
+      }],
+    });
   });
 
   it("opens history, restores a session, exposes report download and sends follow-up", async () => {
@@ -144,10 +145,7 @@ describe("history, report and follow-up interactions", () => {
     await user.click(await screen.findByRole("button", { name: session.title }));
 
     expect(await screen.findByLabelText("完整代码 snippet.py")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "导出报告" })).toHaveAttribute(
-      "href",
-      "/v1/reviews/review-1/report",
-    );
+    expect(screen.getByRole("button", { name: "导出报告" })).toBeEnabled();
     const findingNavigation = screen.getByRole("complementary", { name: "问题导航" });
     await user.click(within(findingNavigation).getByRole("button", { name: /输出调用/ }));
     expect(screen.queryByRole("dialog", { name: "针对代码的二次追问" })).not.toBeInTheDocument();
@@ -169,6 +167,8 @@ describe("history, report and follow-up interactions", () => {
           finding_id: "finding-1",
           selected_code: "print('ok')",
         }),
+        undefined,
+        "a".repeat(64),
       ),
     );
   });
@@ -195,8 +195,8 @@ describe("history, report and follow-up interactions", () => {
     await user.click(await screen.findByRole("button", { name: session.title }));
 
     const navigation = screen.getByRole("complementary", { name: "问题导航" });
-    const firstTrigger = within(navigation).getByRole("button", { name: "输出调用" });
-    const secondTrigger = within(navigation).getByRole("button", { name: "第二个问题" });
+    const firstTrigger = within(navigation).getByRole("button", { name: /输出调用/ });
+    const secondTrigger = within(navigation).getByRole("button", { name: /第二个问题/ });
 
     expect(firstTrigger).toHaveAttribute("aria-expanded", "true");
     expect(secondTrigger).toHaveAttribute("aria-expanded", "false");
@@ -210,8 +210,10 @@ describe("history, report and follow-up interactions", () => {
     expect(within(navigation).queryByLabelText("问题详情：输出调用")).not.toBeInTheDocument();
     const secondPanel = within(navigation).getByLabelText("问题详情：第二个问题");
     expect(secondPanel).toBeVisible();
-    expect(within(secondPanel).getByRole("button", { name: "按建议修改" })).toBeVisible();
-    expect(within(secondPanel).getByRole("button", { name: "暂不修改" })).toBeVisible();
+    expect(within(secondPanel).getByRole("button", { name: "应用修复" })).toBeVisible();
+    expect(within(secondPanel).getByRole("button", { name: "接受风险" })).toBeVisible();
+    expect(within(secondPanel).queryByRole("button", { name: "稍后处理" })).not.toBeInTheDocument();
+    expect(within(secondPanel).queryByRole("button", { name: "判定不成立" })).not.toBeInTheDocument();
   });
 
 });

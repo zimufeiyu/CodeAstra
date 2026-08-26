@@ -40,3 +40,10 @@ test("shows the administrator-only action and opens settings through menu activa
   await interactions.click(screen.getByRole("menuitem", { name: "管理员管理" }));
   expect(onOpenAdmin).toHaveBeenCalledTimes(1);
 });
+
+test("keeps a long username discoverable after visual truncation", () => {
+  const username = "very-long-user-name-for-code-review";
+  render(<SidebarAccountMenu user={{ ...user, username }} onOpenSettings={vi.fn()} onOpenAdmin={vi.fn()} onSignOut={vi.fn()} />);
+  expect(screen.getByText(username)).toHaveAttribute("title", username);
+  expect(screen.getByRole("button", { name: `${username} 的账户菜单` })).toBeInTheDocument();
+});

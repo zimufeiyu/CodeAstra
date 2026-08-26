@@ -31,6 +31,18 @@ ReviewStatus = Literal[
     "failed",
 ]
 FindingSource = Literal["static", "llm", "merged"]
+FindingDecision = Literal["fixed", "accepted_risk", "deferred", "dismissed"]
+
+
+class FindingDecisionAudit(BaseModel):
+    finding_id: str = Field(min_length=1)
+    action: Literal["decided", "reopened"]
+    decision: FindingDecision | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+    reason: str = Field(min_length=1, max_length=2000)
+    revision_retained: bool = False
+
+
 ReviewEventType = Literal["stage", "chunk", "progress", "finding", "complete", "error", "cancelled"]
 
 
@@ -71,6 +83,114 @@ class FindingVerification(BaseModel):
     deduplicated: bool = False
 
 
+RepairIntentKind = Literal[
+    "rename_existing",
+    "declare_parameter",
+    "declare_local",
+    "import_symbol",
+    "custom_behavior",
+    "defer",
+]
+
+
+class SymbolCandidate(BaseModel):
+    name: str
+    kind: Literal["parameter", "import", "assignment", "binding", "export"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    relative_path: str | None = None
+    line: int | None = Field(default=None, ge=1)
+    rationale: str
+
+
+class RepairIntentOption(BaseModel):
+    option_id: str
+    kind: RepairIntentKind
+    label: str
+    symbol: str | None = None
+    module: str | None = None
+    requires_input: Literal["initializer", "module", "behavior", "none"] = "none"
+    input_label: str | None = None
+
+
+class UseDefEvidence(BaseModel):
+    unresolved_name: str
+    scope_kind: str
+    scope_symbol: str | None = None
+    use_node_kind: str = "Name"
+    use_line: int = Field(ge=1)
+    use_column: int = Field(ge=1)
+    statement_kind: str
+    statement_start_line: int = Field(ge=1)
+    statement_end_line: int = Field(ge=1)
+    statement_text: str
+    visible_parameters: list[str] = Field(default_factory=list)
+    visible_imports: list[str] = Field(default_factory=list)
+    visible_assignments: list[str] = Field(default_factory=list)
+    similar_candidates: list[SymbolCandidate] = Field(default_factory=list)
+    cross_file_exports: list[SymbolCandidate] = Field(default_factory=list)
+    control_flow_reachability: Literal["reachable", "conditional", "unknown"] = "unknown"
+    outcome: Literal["safe_plan", "needs_intent"] = "needs_intent"
+    explanation: str
+    options: list[RepairIntentOption] = Field(default_factory=list)
+
+
+class SymbolRepairPlan(BaseModel):
+    mode: Literal["rename", "import", "declare_parameter", "declare_local"]
+    unresolved_name: str
+    replacement_name: str | None = None
+    module: str | None = None
+    initializer: str | None = None
+    definition_symbol: str | None = None
+    statement_start_line: int = Field(ge=1)
+    statement_end_line: int = Field(ge=1)
+    use_line: int = Field(ge=1)
+    use_column: int = Field(ge=1)
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    safety: Literal["safe", "requires_review"]
+    user_selected: bool = False
+
+
+class RepairIntentSelection(BaseModel):
+    review_id: str = Field(min_length=1)
+    finding_id: str = Field(min_length=1)
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    option_id: str = Field(min_length=1)
+    intent_kind: RepairIntentKind
+    selected_symbol: str | None = None
+    import_source: str | None = None
+    initializer: str | None = None
+    user_intent: str | None = Field(default=None, min_length=1, max_length=2000)
+
+
+class RootCauseEvidence(BaseModel):
+    claim: str
+    concrete_failing_input: str
+    expected_behavior: str
+    actual_behavior: str
+    affected_path: str
+    repair_invariant: str
+    contract_evidence: str | None = None
+    reachable_path: str | None = None
+
+
+class RenameCallsite(BaseModel):
+    relative_path: str
+    line: int = Field(ge=1)
+    keyword: str
+
+
+class RenamePlan(BaseModel):
+    old_name: str
+    new_name: str
+    definition_symbol: str
+    affected_keyword_callsites: list[RenameCallsite] = Field(default_factory=list)
+    scope: str
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    safety: Literal["safe", "unsafe", "requires_review"] = "requires_review"
+    executable: bool = False
+    unsafe_reasons: list[str] = Field(default_factory=list)
+
+
 class Finding(BaseModel):
     finding_id: str = Field(min_length=1)
     source: FindingSource
@@ -80,6 +200,7 @@ class Finding(BaseModel):
     severity: SeverityLevel
     confidence: float = Field(ge=0.0, le=1.0)
     file_id: str = Field(min_length=1)
+    relative_path: str | None = None
     start_line: int = Field(ge=1)
     start_column: int = Field(ge=1)
     end_line: int = Field(ge=1)
@@ -91,6 +212,20 @@ class Finding(BaseModel):
     impact: str = Field(min_length=1)
     suggestion: str = Field(min_length=1)
     verification: FindingVerification = Field(default_factory=FindingVerification)
+    analyzer_id: str | None = None
+    source_kind: Literal["deterministic_fact", "model_hypothesis", "verified_hypothesis"] | None = (
+        None
+    )
+    applicability: Literal["applicable", "requires_review", "unavailable"] = "requires_review"
+    fingerprint: str = ""
+    symbol: str | None = None
+    fix_safety: Literal["safe", "unsafe", "requires_review"] = "requires_review"
+    verifier: str | None = None
+    verification_reason: str | None = None
+    rename_plan: RenamePlan | None = None
+    use_def_evidence: UseDefEvidence | None = None
+    symbol_repair_plan: SymbolRepairPlan | None = None
+    root_cause_claim: RootCauseEvidence | None = None
 
     @model_validator(mode="after")
     def validate_source_range(self) -> Finding:
@@ -98,6 +233,28 @@ class Finding(BaseModel):
         end = (self.end_line, self.end_column)
         if end < start:
             raise ValueError("end position must not precede start position")
+        if self.analyzer_id is None:
+            self.analyzer_id = self.analyzer
+        if self.source_kind is None:
+            self.source_kind = (
+                "deterministic_fact"
+                if self.source == "static"
+                else "verified_hypothesis"
+                if self.verification.range_valid and self.verification.evidence_matched
+                else "model_hypothesis"
+            )
+        if not self.fingerprint:
+            normalized = " ".join(self.evidence.casefold().split())
+            self.fingerprint = hashlib.sha256(
+                "\x1f".join(
+                    (
+                        (self.relative_path or self.file_id).casefold(),
+                        self.rule_id.casefold(),
+                        self.symbol or "",
+                        normalized,
+                    )
+                ).encode()
+            ).hexdigest()
         return self
 
 
@@ -166,10 +323,30 @@ class ReviewRevision(BaseModel):
     created_at: datetime
     before_content: str
     before_changed_ranges: list[ChangedLineRange] | None = None
+    before_sha256: str = Field(default="0" * 64, min_length=64, max_length=64)
     after_sha256: str = Field(min_length=64, max_length=64)
     diff: str
     explanation: str | None = None
+    validation: list[str] = Field(default_factory=list)
     undone_at: datetime | None = None
+
+
+class FixCandidate(BaseModel):
+    candidate_id: str = Field(min_length=1)
+    review_id: str = Field(min_length=1)
+    finding_id: str = Field(min_length=1)
+    file_id: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    created_at: datetime
+    expires_at: datetime
+    base_sha256: str = Field(min_length=64, max_length=64)
+    after_sha256: str = Field(min_length=64, max_length=64)
+    diff: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    validation: list[str] = Field(default_factory=list)
+    output_token_budget: int = Field(ge=128)
+    finding_state: Literal["candidate_ready"] = "candidate_ready"
+    fix_safety: Literal["safe", "requires_review"] = "requires_review"
 
 
 class ReviewSession(BaseModel):
@@ -194,9 +371,46 @@ class ReviewSession(BaseModel):
     coverage: list[CoverageState] = Field(default_factory=list)
     summary: ReviewSummary = Field(default_factory=ReviewSummary)
     error: str | None = None
-    finding_decisions: dict[str, Literal["apply", "keep"]] = Field(default_factory=dict)
+    error_code: str | None = None
+    recheck_attempt_id: str | None = None
+    recheck_attempt_status: Literal["running", "completed", "failed", "timed_out"] | None = None
+    recheck_deadline_at: datetime | None = None
+    finding_decisions: dict[str, FindingDecision] = Field(default_factory=dict)
+    decided_findings: dict[str, Finding] = Field(default_factory=dict)
+    finding_decision_history: list[FindingDecisionAudit] = Field(default_factory=list)
     ignored_finding_fingerprints: list[str] = Field(default_factory=list)
     revisions: list[ReviewRevision] = Field(default_factory=list)
+    finding_states: dict[
+        str,
+        Literal[
+            "active",
+            "candidate_ready",
+            "fixed_pending_revalidation",
+            "fixed_verified",
+            "accepted_risk",
+            "deferred",
+            "dismissed",
+            "reopened",
+        ],
+    ] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_finding_decisions(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        decisions = value.get("finding_decisions")
+        if isinstance(decisions, dict):
+            value = dict(value)
+            value["finding_decisions"] = {
+                key: "fixed"
+                if decision == "apply"
+                else "accepted_risk"
+                if decision == "keep"
+                else decision
+                for key, decision in decisions.items()
+            }
+        return value
 
     def display_title(self) -> str:
         if self.title and self.title.strip():
@@ -259,5 +473,3 @@ class FollowupMessage(BaseModel):
     context_key: str = Field(default="review", min_length=1, max_length=300)
     content: str = Field(min_length=1)
     created_at: datetime
-
-

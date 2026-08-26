@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from code_review.application.evidence_validation import merge_findings
+from code_review.application.pipeline_metrics import PipelineMetrics
+from code_review.application.review_policy import ReviewPolicyEngine
 from code_review.domain.review_chunks import ChunkStatus, ReviewChunk, ReviewPlanningError
 from code_review.domain.review_models import Finding, ReviewSession, ReviewSummary
 
@@ -15,6 +17,14 @@ class AggregateResult:
 
 
 class ReviewAggregator:
+    def __init__(
+        self,
+        metrics: PipelineMetrics | None = None,
+        policy: ReviewPolicyEngine | None = None,
+    ) -> None:
+        self._metrics = metrics or PipelineMetrics()
+        self._policy = policy or ReviewPolicyEngine()
+
     def aggregate(
         self,
         session: ReviewSession,
@@ -57,7 +67,11 @@ class ReviewAggregator:
                 code="coverage_incomplete",
                 message="审查覆盖率不足 100%。",
             )
-        findings = merge_findings(static_findings, chunk_findings)
+        merged = merge_findings(static_findings, chunk_findings)
+        findings = self._policy.filter(merged)
+        self._metrics.increment(
+            "deduplicated_findings", len(static_findings) + len(chunk_findings) - len(merged)
+        )
         return AggregateResult(
             findings=findings,
             summary=self._summary(findings),

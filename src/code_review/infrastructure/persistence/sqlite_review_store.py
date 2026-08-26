@@ -103,16 +103,33 @@ class SQLiteReviewStore:
                 ON review_followups(review_id, created_at, message_id);
             """
         )
-        columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(review_followups)")}
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(review_followups)")
+        }
         if "context_key" not in columns:
-            self._connection.execute("ALTER TABLE review_followups ADD COLUMN context_key TEXT NOT NULL DEFAULT 'review'")
-        self._connection.execute("CREATE INDEX IF NOT EXISTS idx_followups_review_context ON review_followups(review_id, context_key, created_at, message_id)")
+            self._connection.execute(
+                "ALTER TABLE review_followups ADD COLUMN context_key TEXT NOT NULL DEFAULT 'review'"
+            )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_followups_review_context "
+            "ON review_followups(review_id, context_key, created_at, message_id)"
+        )
         self._connection.execute("PRAGMA user_version=3")
         self._connection.commit()
 
     async def _run(self, operation: Callable[[], T]) -> T:
         async with self._lock:
             return await asyncio.to_thread(operation)
+
+    @staticmethod
+    def _session_from_row(row: sqlite3.Row) -> ReviewSession:
+        payload = json.loads(row["payload"])
+        # owner_id is intentionally excluded from ReviewSession serialization;
+        # CAS reads must restore the identity held in the protected columns.
+        payload["review_id"] = row["review_id"]
+        payload["owner_id"] = row["owner_id"]
+        return ReviewSession.model_validate(payload)
 
     def _require_owner(self, review_id: str, owner_id: str) -> sqlite3.Row:
         row = self._connection.execute(
@@ -207,7 +224,8 @@ class SQLiteReviewStore:
     async def get(self, review_id: str, owner_id: str) -> ReviewSession | None:
         def operation() -> ReviewSession | None:
             row = self._connection.execute(
-                "SELECT owner_id, payload FROM review_sessions WHERE review_id = ? AND owner_id = ?",
+                "SELECT review_id, owner_id, payload FROM review_sessions "
+                "WHERE review_id = ? AND owner_id = ?",
                 (review_id, owner_id),
             ).fetchone()
             return self._session_from_row(row) if row else None
@@ -283,7 +301,6 @@ class SQLiteReviewStore:
                     "review_findings",
                     "chunk_attempts",
                     "review_chunks",
-                    "review_events",
                     "model_runs",
                 ):
                     self._connection.execute(
@@ -458,6 +475,96 @@ class SQLiteReviewStore:
                 return self._append_event(session.review_id, event, data)
         return await self._run(operation)
 
+    @staticmethod
+    def _matches_running_recheck(session: ReviewSession, attempt_id: str) -> bool:
+        return (
+            session.recheck_attempt_id == attempt_id
+            and session.recheck_attempt_status == "running"
+            and session.status not in _TERMINAL_REVIEW_STATUSES
+        )
+
+    async def is_recheck_attempt_current(
+        self, review_id: str, owner_id: str, attempt_id: str
+    ) -> bool:
+        def operation() -> bool:
+            row = self._connection.execute(
+                "SELECT review_id, owner_id, payload FROM review_sessions "
+                "WHERE review_id = ? AND owner_id = ?",
+                (review_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(review_id)
+            return self._matches_running_recheck(
+                self._session_from_row(row), attempt_id
+            )
+
+        return await self._run(operation)
+
+    async def save_review_if_recheck_attempt(
+        self, session: ReviewSession, attempt_id: str
+    ) -> bool:
+        def operation() -> bool:
+            with self._connection:
+                row = self._connection.execute(
+                    "SELECT review_id, owner_id, payload FROM review_sessions "
+                    "WHERE review_id = ? AND owner_id = ?",
+                    (session.review_id, session.owner_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(session.review_id)
+                current = self._session_from_row(row)
+                if not self._matches_running_recheck(current, attempt_id):
+                    return False
+                persisted = session.model_copy(update={"title": current.title})
+                self._connection.execute(
+                    "UPDATE review_sessions SET status = ?, payload = ? "
+                    "WHERE review_id = ? AND owner_id = ?",
+                    (
+                        persisted.status,
+                        persisted.model_dump_json(),
+                        session.review_id,
+                        session.owner_id,
+                    ),
+                )
+                return True
+
+        return await self._run(operation)
+
+    async def transition_review_if_recheck_attempt(
+        self,
+        session: ReviewSession,
+        attempt_id: str,
+        event: ReviewEventType,
+        data: dict[str, object],
+    ) -> bool:
+        def operation() -> bool:
+            with self._connection:
+                row = self._connection.execute(
+                    "SELECT review_id, owner_id, payload FROM review_sessions "
+                    "WHERE review_id = ? AND owner_id = ?",
+                    (session.review_id, session.owner_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(session.review_id)
+                current = self._session_from_row(row)
+                if not self._matches_running_recheck(current, attempt_id):
+                    return False
+                persisted = session.model_copy(update={"title": current.title})
+                self._connection.execute(
+                    "UPDATE review_sessions SET status = ?, payload = ? "
+                    "WHERE review_id = ? AND owner_id = ?",
+                    (
+                        persisted.status,
+                        persisted.model_dump_json(),
+                        session.review_id,
+                        session.owner_id,
+                    ),
+                )
+                self._append_event(session.review_id, event, data)
+                return True
+
+        return await self._run(operation)
+
     async def events_after(
         self, review_id: str, owner_id: str, after: int
     ) -> list[ReviewEvent]:
@@ -516,7 +623,9 @@ class SQLiteReviewStore:
                 return reviews
         return await self._run(operation)
 
-    async def followups(self, review_id: str, owner_id: str, context_key: str = "review") -> list[FollowupMessage]:
+    async def followups(
+        self, review_id: str, owner_id: str, context_key: str = "review"
+    ) -> list[FollowupMessage]:
         def operation() -> list[FollowupMessage]:
             with self._connection:
                 self._require_owner(review_id, owner_id)

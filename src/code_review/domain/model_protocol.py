@@ -9,6 +9,23 @@ ExposureLevel = Literal["internet", "authenticated", "internal", "local", "unkno
 ModelProvider = Literal["local", "deepseek"]
 
 
+class RootCauseClaim(BaseModel):
+    claim: str = Field(min_length=1)
+    concrete_failing_input: str = Field(min_length=1)
+    expected_behavior: str = Field(min_length=1)
+    actual_behavior: str = Field(min_length=1)
+    affected_path: str = Field(min_length=1)
+    repair_invariant: str = Field(min_length=1)
+    contract_evidence: str | None = None
+    reachable_path: str | None = None
+
+    @model_validator(mode="after")
+    def require_verifiable_path(self) -> "RootCauseClaim":
+        if not (self.contract_evidence or self.reachable_path):
+            raise ValueError("root cause requires contract evidence or a reachable path")
+        return self
+
+
 class ModelSelection(BaseModel):
     profile_id: str = Field(min_length=1)
     provider: ModelProvider
@@ -71,6 +88,7 @@ class ReviewFinding(BaseModel):
     exposure: ExposureLevel = "unknown"
     risk_score: int = Field(default=0, ge=0, le=100)
     severity_reason: str = Field(default="", max_length=500)
+    root_cause_claim: RootCauseClaim | None = None
 
     @model_validator(mode="after")
     def validate_line_range(self) -> "ReviewFinding":
@@ -86,5 +104,19 @@ class ReviewResponse(BaseModel):
 
 
 class FixProposal(BaseModel):
+    target_file: str = Field(min_length=1)
+    base_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    replacement_mode: Literal[
+        "full_file", "expression", "statement", "statement_block", "definition", "replace_span"
+    ]
+    anchor: str = Field(min_length=1)
     replacement: str
     explanation: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_replacement_range(self) -> "FixProposal":
+        if self.end_line < self.start_line:
+            raise ValueError("fix proposal end_line must be >= start_line")
+        return self

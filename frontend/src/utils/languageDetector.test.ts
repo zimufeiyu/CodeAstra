@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { detectLanguage } from './languageDetector';
+import {
+  canonicalPathKey,
+  detectLanguage,
+  duplicateCanonicalPaths,
+  uniqueSnippetFilename,
+  validateSourceText,
+} from './languageDetector';
 
 describe('detectLanguage', () => {
   it('detects Python from a supported filename', () => {
@@ -59,5 +65,24 @@ describe('detectLanguage', () => {
     expect(detectLanguage('SELECT * FROM users;', 'query.sql').error).toContain('Python');
     expect(detectLanguage('hello world').language).toBeNull();
     expect(detectLanguage('hello world').error).toBeTruthy();
+  });
+});
+
+describe('source input safety', () => {
+  it('rejects NUL, replacement characters and dangerous control text', () => {
+    expect(validateSourceText("print('ok')\0")).toContain('NUL');
+    expect(validateSourceText("print('ok')\uFFFD")).toContain('UTF-8');
+    expect(validateSourceText("x=1\x01\x02")).toContain('控制字符');
+    expect(validateSourceText("def ok():\n\treturn 1\n")).toBeNull();
+  });
+
+  it('uses slash, NFC and cross-platform casing for path identity', () => {
+    expect(canonicalPathKey('Pkg\\cafe\u0301.py')).toBe(canonicalPathKey('pkg/caf\u00e9.py'));
+    expect(duplicateCanonicalPaths(['Pkg\\item.py', 'pkg/item.py'])).toHaveLength(2);
+  });
+
+  it('chooses a non-conflicting virtual snippet name', () => {
+    expect(uniqueSnippetFilename('python', ['SNIPPET.py', 'snippet-2.py'])).toBe('snippet-3.py');
+    expect(uniqueSnippetFilename('cpp', ['src/main.cpp'])).toBe('snippet.cpp');
   });
 });

@@ -1,6 +1,6 @@
 import { FormEvent, ReactNode, useEffect, useState } from "react";
 
-import { getCurrentUser, installAuthenticatedFetch, login, logout, AuthUser } from "../api/authClient";
+import { AUTH_EXPIRED_EVENT, getCurrentUser, installAuthenticatedFetch, login, logout, AuthUser } from "../api/authClient";
 import { AccountSecurityPanel, clearUserScopedBrowserState } from "./AccountSecurityPanel";
 import { AdminUsersPage } from "./AdminUsersPage";
 import { AuthSessionProvider } from "./AuthSessionContext";
@@ -36,6 +36,12 @@ export function AuthGate({ app }: { app: ReactNode }) {
     return () => { active = false; };
   }, [app]);
 
+  useEffect(() => {
+    const handleExpired = () => returnToLogin("账号已在其他设备登录或会话已过期，请重新登录");
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleExpired);
+  }, []);
+
   function returnToLogin(message = "") {
     clearUserScopedBrowserState();
     setUser(null); setPassword(""); setAccountOpen(false); setState("login"); setError(message);
@@ -63,5 +69,4 @@ export function AuthGate({ app }: { app: ReactNode }) {
   if (!user) return null;
   return <AuthSessionProvider value={{ user, accountSettingsOpen: accountOpen, openAccountSettings: () => setAccountOpen(true), closeAccountSettings: () => setAccountOpen(false), openAdminManagement: () => { setAccountOpen(false); setAdminReview(false); }, signOut: () => void signOut() }}><div className="auth-session">{app}</div></AuthSessionProvider>;
 }
-
 

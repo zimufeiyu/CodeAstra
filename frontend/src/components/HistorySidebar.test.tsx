@@ -80,3 +80,41 @@ it("renames inline and requires confirmation before permanent deletion", async (
   expect(confirm).toHaveBeenCalledTimes(2);
 });
 
+it("keeps 101 grouped records in one scroll surface and exposes paged loading states", async () => {
+  const user = userEvent.setup();
+  const onLoadMore = vi.fn().mockResolvedValue(undefined);
+  const records = Array.from({ length: 101 }, (_, index) => (
+    item(`review-${index}`, `很长的历史记录标题 ${index}`)
+  ));
+  const { container, rerender } = render(
+    <HistorySidebar
+      items={records}
+      activeReviewId="review-100"
+      onNewReview={() => undefined}
+      onOpen={() => undefined}
+      onRename={() => undefined}
+      onDelete={() => undefined}
+      hasMore
+      onLoadMore={onLoadMore}
+    />,
+  );
+
+  expect(container.querySelectorAll(".history-title-button")).toHaveLength(101);
+  expect(container.querySelectorAll(".history-scroll")).toHaveLength(1);
+  await user.click(screen.getByRole("button", { name: "加载更多" }));
+  expect(onLoadMore).toHaveBeenCalledTimes(1);
+
+  rerender(
+    <HistorySidebar
+      items={records}
+      activeReviewId="review-100"
+      onNewReview={() => undefined}
+      onOpen={() => undefined}
+      onRename={() => undefined}
+      onDelete={() => undefined}
+      hasMore={false}
+      loadError=""
+    />,
+  );
+  expect(screen.getByText("已加载全部")).toBeInTheDocument();
+});

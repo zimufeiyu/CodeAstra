@@ -20,6 +20,7 @@ vi.mock("./api/client", async (importOriginal) => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.history.replaceState({}, "", "/");
   vi.mocked(getInstanceHealth).mockResolvedValue({ instances: [] });
   vi.mocked(listReviewSessions).mockResolvedValue({ items: [], limit: 100, offset: 0 });
   vi.mocked(createReviewSession).mockResolvedValue({
@@ -55,7 +56,7 @@ beforeEach(() => {
 });
 
 
-it("keeps the draft after failure and can resume the unfinished review", async () => {
+it("keeps the failed review resumable while isolating and restoring the draft", async () => {
   const failed = {
     review_id: "review-1",
     title: "代码审查 · 2026-08-03 00:00",
@@ -88,12 +89,16 @@ it("keeps the draft after failure and can resume the unfinished review", async (
   await user.type(composer, "eval(user_input)");
   await user.click(screen.getByRole("button", { name: "发送审查" }));
 
-  expect(await screen.findByRole("button", { name: "继续未完成审查" })).toBeInTheDocument();
-  expect(composer).toHaveValue("eval(user_input)");
-  await user.click(screen.getByRole("button", { name: "继续未完成审查" }));
+  expect(await screen.findByRole("button", { name: "重新复查" })).toBeInTheDocument();
+  expect(composer).toBeDisabled();
+  expect(composer).toHaveValue("");
+  await user.click(screen.getByRole("button", { name: "重新复查" }));
 
   await waitFor(() => expect(resumeReviewSession).toHaveBeenCalledWith("review-1"));
   await waitFor(() => expect(streamReviewSession).toHaveBeenCalledTimes(2));
+  await user.click(screen.getByRole("button", { name: "新建审查" }));
+  expect(composer).toBeEnabled();
+  expect(composer).toHaveValue("eval(user_input)");
 });
 
 it("uses one chat-style composer instead of separate entry modes", async () => {
@@ -129,6 +134,21 @@ it("shows uploaded files in the composer and allows removing them", async () => 
   expect(screen.getByRole("button", { name: "\u5220\u9664 main.cpp" })).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "\u5220\u9664 main.cpp" }));
   expect(screen.queryByText("main.cpp")).not.toBeInTheDocument();
+});
+
+it("rejects an oversized upload before reading it into the review draft", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  const file = new File(["x".repeat(2 * 1024 * 1024 + 1)], "large.py", {
+    type: "text/plain",
+  });
+
+  await user.upload(screen.getByLabelText("添加代码文件"), file);
+
+  expect(await screen.findByText("large.py：单个代码文件不能超过 2 MiB。"))
+    .toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "删除 large.py" })).not.toBeInTheDocument();
+  expect(createReviewSession).not.toHaveBeenCalled();
 });
 
 

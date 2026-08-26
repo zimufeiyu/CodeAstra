@@ -46,5 +46,5 @@ test("uses a saved GitLab account token when previewing an MR", async () => {
     "saved-token",
     expect.any(AbortSignal),
   ));
-  expect(screen.queryByLabelText("访问令牌（私有项目需要）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("访问令牌（旧版兼容方式）")).not.toBeInTheDocument();
 });

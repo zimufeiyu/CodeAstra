@@ -4,10 +4,14 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Protocol
 
 from code_review.application.inference_service import ReviewStreamEvent
+from code_review.domain.model_ports import InstanceRegistryPort
 from code_review.domain.model_protocol import FixProposal, InferenceRequest, ReviewResponse
 
 
 class InferenceServiceAdapter(Protocol):
+    @property
+    def registry(self) -> InstanceRegistryPort: ...
+
     async def review(self, request: InferenceRequest) -> ReviewResponse: ...
     def review_stream(
         self,
@@ -38,6 +42,13 @@ class RoutedInferenceService:
     @property
     def available_profile_ids(self) -> frozenset[str]:
         return frozenset(self._services)
+
+    @property
+    def profile_registries(self) -> Mapping[str, InstanceRegistryPort]:
+        return {
+            profile_id: service.registry
+            for profile_id, service in self._services.items()
+        }
 
     def _for(self, request: InferenceRequest) -> InferenceServiceAdapter:
         profile_id = request.model_profile_id or self._default_profile_id

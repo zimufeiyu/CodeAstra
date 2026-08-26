@@ -40,7 +40,7 @@ class AuthService:
         if not valid or not user.is_active:
             raise InvalidCredentialsError("invalid username or password")
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        session = await self._store.create_session(user.user_id, token, csrf)
+        session = await self._store.create_single_session(user.user_id, token, csrf)
         return LoginResult(
             user=user,
             session_id=session.session_id,

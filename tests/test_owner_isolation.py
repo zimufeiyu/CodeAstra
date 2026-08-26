@@ -564,7 +564,9 @@ async def test_hybrid_run_publishes_static_findings_with_the_persisted_owner():
 async def test_hybrid_resume_and_cancel_keep_the_owner_on_store_access():
     class ResumeCancelStore:
         def __init__(self) -> None:
-            self.session = _session('resume-review', 'owner-id')
+            self.session = _session('resume-review', 'owner-id').model_copy(
+                update={'status': 'failed'}
+            )
             self.calls: list[tuple[str, str]] = []
 
         async def get(self, review_id, owner_id):
@@ -589,6 +591,7 @@ async def test_hybrid_resume_and_cancel_keep_the_owner_on_store_access():
     service = object.__new__(HybridReviewService)
     service._store = store
     service._tasks = {}
+    service._fix_locks = {}
     restarted: list[tuple[str, str]] = []
 
     async def start(review_id: str, owner_id: str) -> None:
@@ -596,6 +599,8 @@ async def test_hybrid_resume_and_cancel_keep_the_owner_on_store_access():
 
     service.start = start
 
+    assert await service.resume('resume-review', 'owner-id') is True
+    # A repeated click observes the queued state and must not schedule a duplicate run.
     assert await service.resume('resume-review', 'owner-id') is True
     assert await service.cancel('resume-review', 'owner-id') is True
     assert restarted == [('resume-review', 'owner-id')]

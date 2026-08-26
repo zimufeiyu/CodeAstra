@@ -15,6 +15,9 @@ dependencies = [
   "tree-sitter-cpp==0.23.4",
   "uvicorn",
   "argon2-cffi",
+  "libcst==1.9.0",
+  "pyflakes==3.4.0",
+  "ruff==0.16.3",
 ]
 
 [project.optional-dependencies]

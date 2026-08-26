@@ -10,6 +10,10 @@ type HistorySidebarProps = {
   onOpen: (reviewId: string) => void | Promise<void>;
   onRename: (reviewId: string, title: string) => void | Promise<void>;
   onDelete: (reviewId: string) => void | Promise<void>;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  loadError?: string;
+  onLoadMore?: () => void | Promise<void>;
 };
 
 type HistoryGroup = {
@@ -44,6 +48,10 @@ export function HistorySidebar({
   onOpen,
   onRename,
   onDelete,
+  hasMore = false,
+  loadingMore = false,
+  loadError = "",
+  onLoadMore,
 }: HistorySidebarProps) {
   const groups = useMemo(() => groupHistory(items), [items]);
   const [menuId, setMenuId] = useState<string | null>(null);
@@ -159,7 +167,19 @@ export function HistorySidebar({
         ))}
         {!items.length ? <p className="history-empty">暂无审查记录</p> : null}
       </div>
+      <div className="history-pagination" aria-live="polite">
+        {loadError ? <p role="alert">{loadError}</p> : null}
+        {hasMore || loadError ? (
+          <button
+            type="button"
+            className="history-load-more"
+            disabled={loadingMore}
+            onClick={() => void onLoadMore?.()}
+          >
+            {loadingMore ? "加载中…" : loadError ? "重试加载更多" : "加载更多"}
+          </button>
+        ) : items.length ? <span>已加载全部</span> : null}
+      </div>
     </nav>
   );
 }
-

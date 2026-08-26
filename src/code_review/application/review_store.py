@@ -37,7 +37,9 @@ class InMemoryReviewStore:
     async def get(self, review_id: str, owner_id: str) -> ReviewSession | None:
         async with self._lock:
             session = self._sessions.get(review_id)
-            return session.model_copy(deep=True) if session is not None and session.owner_id == owner_id else None
+            if session is None or session.owner_id != owner_id:
+                return None
+            return session.model_copy(deep=True)
 
     async def save(self, session: ReviewSession) -> None:
         async with self._lock:
@@ -89,10 +91,15 @@ class InMemoryReviewStore:
                 if event.sequence > after
             ]
 
-    async def followups(self, review_id: str, owner_id: str, context_key: str = "review") -> list[FollowupMessage]:
+    async def followups(
+        self, review_id: str, owner_id: str, context_key: str = "review"
+    ) -> list[FollowupMessage]:
         async with self._lock:
             self._require_owner(review_id, owner_id)
-            return [item.model_copy(deep=True) for item in self._followups.get((review_id, context_key), [])]
+            return [
+                item.model_copy(deep=True)
+                for item in self._followups.get((review_id, context_key), [])
+            ]
 
     async def append_followup_exchange(
         self,
@@ -151,7 +158,6 @@ class EnhancedInMemoryReviewStore(InMemoryReviewStore):
             current = self._require_owner(session.review_id, session.owner_id)
             persisted = session.model_copy(update={"title": current.title})
             self._sessions[session.review_id] = persisted.model_copy(deep=True)
-            self._events[session.review_id] = []
             chunk_ids = {
                 chunk_id
                 for chunk_id, chunk in self._chunks.items()
@@ -254,6 +260,53 @@ class EnhancedInMemoryReviewStore(InMemoryReviewStore):
         await self.save(session)
         return await self.publish(session.review_id, session.owner_id, event, data)
 
+    @staticmethod
+    def _matches_running_recheck(session: ReviewSession, attempt_id: str) -> bool:
+        return (
+            session.recheck_attempt_id == attempt_id
+            and session.recheck_attempt_status == "running"
+            and session.status not in {"completed", "cancelled", "failed"}
+        )
+
+    async def is_recheck_attempt_current(
+        self, review_id: str, owner_id: str, attempt_id: str
+    ) -> bool:
+        async with self._lock:
+            current = self._require_owner(review_id, owner_id)
+            return self._matches_running_recheck(current, attempt_id)
+
+    async def save_review_if_recheck_attempt(
+        self, session: ReviewSession, attempt_id: str
+    ) -> bool:
+        async with self._lock:
+            current = self._require_owner(session.review_id, session.owner_id)
+            if not self._matches_running_recheck(current, attempt_id):
+                return False
+            persisted = session.model_copy(update={"title": current.title})
+            self._sessions[session.review_id] = persisted.model_copy(deep=True)
+            return True
+
+    async def transition_review_if_recheck_attempt(
+        self,
+        session: ReviewSession,
+        attempt_id: str,
+        event: ReviewEventType,
+        data: dict[str, object],
+    ) -> bool:
+        async with self._lock:
+            current = self._require_owner(session.review_id, session.owner_id)
+            if not self._matches_running_recheck(current, attempt_id):
+                return False
+            persisted = session.model_copy(update={"title": current.title})
+            self._sessions[session.review_id] = persisted.model_copy(deep=True)
+            review_event = ReviewEvent(
+                sequence=len(self._events[session.review_id]) + 1,
+                event=event,
+                data=data,
+            )
+            self._events[session.review_id].append(review_event)
+            return True
+
     async def recoverable_reviews(self) -> list[tuple[str, str]]:
         async with self._lock:
             return sorted(
@@ -278,5 +331,3 @@ class EnhancedInMemoryReviewStore(InMemoryReviewStore):
 
 
 ReviewStore = EnhancedInMemoryReviewStore
-
-

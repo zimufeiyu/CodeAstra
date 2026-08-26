@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   askReviewFollowup,
   createReviewSession,
-  decideReviewFinding,
   getDeepSeekModels,
+  previewReviewFix,
   resumeReviewSession,
   undoReviewRevision,
 } from "./client";
@@ -35,7 +35,7 @@ describe("DeepSeek user credential forwarding", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse({ review_id: "r1", status: "queued", expires_at: "later" }))
       .mockResolvedValueOnce(jsonResponse({}))
-      .mockResolvedValueOnce(jsonResponse({ session: {}, revised_review: null, explanation: null }))
+      .mockResolvedValueOnce(jsonResponse({ candidate: {} }))
       .mockResolvedValueOnce(jsonResponse({ revised_review: {} }))
       .mockResolvedValueOnce(jsonResponse({ messages: [] }));
 
@@ -46,7 +46,7 @@ describe("DeepSeek user credential forwarding", () => {
       deepseek_selection_mode: "auto",
     }, "sk-private");
     await resumeReviewSession("r1", "sk-private");
-    await decideReviewFinding("r1", "f1", "keep", "sk-private");
+    await previewReviewFix("r1", "f1", "sk-private");
     await undoReviewRevision("r1", "rev1", "sk-private");
     await askReviewFollowup("r1", "why?", undefined, "sk-private");
 

@@ -127,7 +127,10 @@ def get_inference_service() -> RoutedInferenceService:
 
 @lru_cache
 def get_gateway_health_service() -> GatewayHealthService:
-    return GatewayHealthService(get_instance_registry())
+    return GatewayHealthService(
+        get_inference_service().profile_registries,
+        get_http_client(),
+    )
 
 
 @lru_cache

@@ -17,6 +17,7 @@ it("shows read-only account details and both logout actions", async () => {
   expect(screen.getByText("普通用户")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "退出所有设备" })).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "登录设备" }));
+  expect(await screen.findByText(/单设备登录已启用/)).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "退出所有设备" }));
   expect(api.logoutAll).toHaveBeenCalledWith("csrf");
 });

@@ -69,6 +69,19 @@ class ReviewStorePort(Protocol):
         event: ReviewEventType,
         data: dict[str, object],
     ) -> ReviewEvent: ...
+    async def transition_review_if_recheck_attempt(
+        self,
+        session: ReviewSession,
+        attempt_id: str,
+        event: ReviewEventType,
+        data: dict[str, object],
+    ) -> bool: ...
+    async def save_review_if_recheck_attempt(
+        self, session: ReviewSession, attempt_id: str
+    ) -> bool: ...
+    async def is_recheck_attempt_current(
+        self, review_id: str, owner_id: str, attempt_id: str
+    ) -> bool: ...
 
 
 class ReviewInferencePort(Protocol):
@@ -90,5 +103,4 @@ class SyntaxChunkerPort(Protocol):
 
 class TokenEstimatorPort(Protocol):
     def estimate_text(self, content: str) -> int: ...
-
 

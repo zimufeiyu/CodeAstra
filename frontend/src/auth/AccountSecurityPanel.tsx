@@ -95,7 +95,7 @@ export function AccountSecurityPanel({ user, onSignedOut, onClose, forced = fals
   const security = <><h2>修改密码</h2><PasswordChangeForm csrfToken={csrf} onComplete={onSignedOut} api={resolvedApi} /></>;
   const gitlab = gitLabConnections ? <section className="auth-gitlab-connections" aria-labelledby="auth-gitlab-title"><div><span className="auth-kicker">GitLab connections</span><h2 id="auth-gitlab-title">GitLab 连接</h2><p>管理当前浏览器中用于导入合并请求的 GitLab 账户。</p></div>{gitLabConnections}</section> : <p>尚未连接 GitLab 账户。</p>;
   const devices = <section className="auth-session-section" aria-labelledby="auth-session-title">
-    <div><span className="auth-kicker">Active session</span><h2 id="auth-session-title">登录设备</h2><p>{deviceBusy && !sessions ? "正在读取登录状态…" : `当前账号共有 ${sessions?.total ?? 0} 个活动会话。新设备登录后，旧设备会自动退出。`}</p></div>
+    <div><span className="auth-kicker">Active session</span><h2 id="auth-session-title">登录设备</h2><p>{deviceBusy && !sessions ? "正在读取登录状态…" : `当前账号共有 ${sessions?.total ?? 0} 个活动会话；单设备登录已启用，新设备登录后旧会话立即失效。`}</p></div>
     {deviceError && <p className="auth-error" role="alert">{deviceError}</p>}
     <div className="auth-session-list">
       {sessions?.items.map((item) => <article key={item.session_id} className="auth-session-item"><div><strong>{item.current ? "当前设备" : "其他设备"}</strong><span>{item.current ? "正在使用" : "活动会话"}</span></div><dl><div><dt>登录时间</dt><dd>{new Date(item.created_at).toLocaleString()}</dd></div><div><dt>最近活动</dt><dd>{new Date(item.last_seen_at).toLocaleString()}</dd></div><div><dt>自动过期</dt><dd>{new Date(item.expires_at).toLocaleString()}</dd></div></dl></article>)}

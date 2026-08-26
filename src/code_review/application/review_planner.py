@@ -5,6 +5,7 @@ import hashlib
 from code_review.application.chunking.cpp_chunker import CppSyntaxChunker
 from code_review.application.chunking.dependency_resolver import DependencyResolver
 from code_review.application.chunking.python_chunker import PythonSyntaxChunker
+from code_review.application.pipeline_metrics import PipelineMetrics
 from code_review.domain.review_chunks import (
     ChunkStatus,
     ReviewChunk,
@@ -15,10 +16,10 @@ from code_review.domain.review_models import SourceFile
 
 
 class ReviewPlanner:
-    def __init__(self) -> None:
+    def __init__(self, metrics: PipelineMetrics | None = None) -> None:
         self._python = PythonSyntaxChunker()
         self._cpp = CppSyntaxChunker()
-        self._dependencies = DependencyResolver()
+        self._dependencies = DependencyResolver(metrics)
 
     def plan(self, review_id: str, files: list[SourceFile]) -> ReviewPlan:
         chunks: list[ReviewChunk] = []
