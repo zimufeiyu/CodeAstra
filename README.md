@@ -2,6 +2,32 @@
 
 CodeAstra 是一个面向真实研发流程的多用户智能代码审查与辅助修复平台。它将静态分析、本地 Qwen/SGLang 模型和 DeepSeek API 组合为证据驱动的审查流水线，让每个问题都能关联到文件、代码范围、风险、证据、验证状态与可执行修复，而不只是返回一段模型文本。
 
+> 没有本地模型也可以使用：将服务设置为 **DeepSeek-only**，在页面中选择 **DeepSeek API** 并填写自己的 API Key，即可使用完整的代码导入、审查、修复、追问和历史管理流程，无需部署 Qwen、SGLang 或 PPU/GPU 环境。
+
+## 界面预览
+
+### 使用流程
+
+![CodeAstra 使用流程](docs/images/codeastra-user-guide/00-user-flow.svg)
+
+### 主工作区
+
+![CodeAstra 主工作区](docs/images/codeastra-user-guide/02-main-workspace.png)
+
+### 添加代码与项目
+
+![添加代码、文件或项目](docs/images/codeastra-user-guide/03-add-content-menu.png)
+
+### GitLab 连接
+
+![GitLab 连接管理](docs/images/codeastra-user-guide/07-gitlab-connections.png)
+
+### 账户安全
+
+![密码与账户安全设置](docs/images/codeastra-user-guide/08-password-security.png)
+
+完整界面图片还包括[登录页面](docs/images/codeastra-user-guide/01-login.png)、[账户菜单](docs/images/codeastra-user-guide/05-account-menu.png)和[登录设备管理](docs/images/codeastra-user-guide/09-login-devices.png)。
+
 ## 完整功能
 
 ### 多来源代码审查
@@ -37,6 +63,7 @@ CodeAstra 是一个面向真实研发流程的多用户智能代码审查与辅�
 ### 多模型与部署能力
 
 - 支持本地 Qwen3/SGLang OpenAI 兼容端点和 DeepSeek API。
+- 本地模型不是必需依赖；可使用 `deepseek_only` 模式只连接 DeepSeek。
 - 通过模型 profile 固定审查所使用的模型与路由，保持结果可解释。
 - 支持模型实例健康检查、故障分类、路由与容量状态展示。
 - 提供部署状态、环境探测、模型发现、部署计划和应用接口。
@@ -66,6 +93,48 @@ CodeAstra 是一个面向真实研发流程的多用户智能代码审查与辅�
 - 分层结构：`domain`、`application`、`infrastructure`、`integrations`、`api` 和 `frontend`。
 
 更详细的设计边界见 [架构说明](docs/ARCHITECTURE.md)，部署资料见 [运维文档](docs/operations/README.md)。
+
+## 没有本地模型：仅使用 DeepSeek
+
+如果电脑或服务器没有 Qwen 权重、SGLang、PPU/GPU，CodeAstra 仍可正常运行。此模式保留静态分析、多文件审查、证据校验、安全修复、结果导出、上下文追问、GitLab 集成和多用户管理，仅把模型推理交给 DeepSeek API。
+
+### 1. 设置 DeepSeek-only 模式
+
+启动后端前设置部署模式：
+
+Linux/macOS：
+
+```bash
+export CODE_REVIEW_DEPLOYMENT_MODE=deepseek_only
+uvicorn code_review.api.main:app --app-dir src --host 127.0.0.1 --port 8081
+```
+
+Windows PowerShell：
+
+```powershell
+$env:CODE_REVIEW_DEPLOYMENT_MODE = "deepseek_only"
+uvicorn code_review.api.main:app --app-dir src --host 127.0.0.1 --port 8081
+```
+
+Windows 默认采用 DeepSeek-only；显式设置该变量可以让不同环境的行为保持一致。此模式会启用 `deepseek-api` profile，并禁用本地 Qwen 端点。
+
+### 2. 在页面中配置 DeepSeek
+
+1. 登录 CodeAstra。
+2. 在模型选择器中选择 **DeepSeek API**。
+3. 输入自己的 DeepSeek API Key。
+4. 点击 **验证并加载模型**。
+5. 使用自动选择，或手动选择账号当前可用的 DeepSeek 模型。
+6. 添加代码并开始审查。
+
+API Key 保存在当前浏览器的本地存储中，并按 CodeAstra 用户账号隔离；发起 DeepSeek 请求时由页面传给后端。不要把真实 Key 写入 README、源码、`.env` 示例或提交记录。浏览器存储并不等同于系统级密钥保险库，请只在可信设备和 HTTPS 页面上使用，并在共享设备使用后清除 Key。
+
+### 3. 使用边界
+
+- 不需要：本地模型权重、SGLang、PPU/GPU、CUDA 或本地模型端口。
+- 仍需要：可访问 DeepSeek API 的网络、有效 API Key、可用权限和账户余额。
+- DeepSeek 不可达、Key 无效、请求限流或余额不足时，模型审查会失败；静态分析能力本身不因此变成本地模型推理。
+- 每次审查创建后会固定使用选定的模型，避免执行过程中切换模型造成结果不可解释。
 
 ## 本地开发
 
